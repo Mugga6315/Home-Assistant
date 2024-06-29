@@ -21,3 +21,6 @@ ota:
 wifi:
 
 improv_serial:
+
+packages:
+  ld2450: !include common/ld2450.yaml
