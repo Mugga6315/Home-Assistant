@@ -21,10 +21,6 @@ binary_sensor:
       name: Moving Target
     has_still_target:
       name: Still Target
-  - platform: gpio
-    pin: 18
-    name: Occupancy
-    device_class: Occupancy
 
 sensor:
   - platform: ld2410
