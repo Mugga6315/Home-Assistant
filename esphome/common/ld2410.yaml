@@ -1,7 +1,7 @@
 esphome:
   on_boot:
     then:
-      - switch.turn_on: engineering_mode
+      - switch.turn_off: engineering_mode
 
 uart:
   id: uart_bus
