@@ -1,11 +1,11 @@
 esphome:
   on_boot:
     then:
-      - switch.turn_off: engineering_mode
+      - switch.turn_off: ${devicename_cleared}_engineering_mode
 
 uart:
   id: uart_bus
-  baud_rate:  256000
+  baud_rate: 256000
   tx_pin: RX
   rx_pin: TX
   parity: NONE
@@ -17,10 +17,13 @@ binary_sensor:
   - platform: ld2410
     has_target:
       name: Occupancy
+      id: ${devicename_cleared}_occupancy
     has_moving_target:
       name: Moving Target
+      id: ${devicename_cleared}_moving_target
     has_still_target:
       name: Still Target
+      id: ${devicename_cleared}_still_target
 
 sensor:
   - platform: ld2410
@@ -29,67 +32,91 @@ sensor:
       disabled_by_default: true
     moving_distance:
       name: Moving Target Distance
+      id: ${devicename_cleared}_moving_target_distance
     still_distance:
       name: Still Target Distance
+      id: ${devicename_cleared}_still_target_distance
     moving_energy:
       name: Moveing Target Energy
+      id: ${devicename_cleared}_moveing_target_energy
     still_energy:
       name: Still Target Energy
+      id: ${devicename_cleared}_still_target_energy
     detection_distance:
       name: Detection Distance
+      id: ${devicename_cleared}_detection_distance
     g0:
       move_energy:
         name: Gate 0 Movement Energy
+        id: ${devicename_cleared}_gate_0_movement_energy
       still_energy:
         name: Gate 0 Still Energy
+        id: ${devicename_cleared}_gate_0_still_energy
     g1:
       move_energy:
         name: Gate 1 Movement Energy
+        id: ${devicename_cleared}_gate_1_movement_energy
       still_energy:
         name: Gate 1 Still Energy
+        id: ${devicename_cleared}_gate_1_still_energy
     g2:
       move_energy:
         name: Gate 2 Movement Energy
+        id: ${devicename_cleared}_gate_2_movement_energy
       still_energy:
         name: Gate 2 Still Energy
+        id: ${devicename_cleared}_gate_2_still_energy
     g3:
       move_energy:
         name: Gate 3 Movement Energy
+        id: ${devicename_cleared}_gate_3_movement_energy
       still_energy:
         name: Gate 3 Still Energy
+        id: ${devicename_cleared}_gate_3_still_energy
     g4:
       move_energy:
         name: Gate 4 Movement Energy
+        id: ${devicename_cleared}_gate_4_movement_energy
       still_energy:
         name: Gate 4 Still Energy
+        id: ${devicename_cleared}_gate_4_still_energy
     g5:
       move_energy:
         name: Gate 5 Movement Energy
+        id: ${devicename_cleared}_gate_5_movement_energy
       still_energy:
         name: Gate 5 Still Energy
+        id: ${devicename_cleared}_gate_5_still_energy
     g6:
       move_energy:
         name: Gate 6 Movement Energy
+        id: ${devicename_cleared}_gate_6_movement_energy
       still_energy:
         name: Gate 6 Still Energy
+        id: ${devicename_cleared}_gate_6_still_energy
     g7:
       move_energy:
         name: Gate 7 Movement Energy
+        id: ${devicename_cleared}_gate_7_movement_energy
       still_energy:
         name: Gate 7 Still Energy
+        id: ${devicename_cleared}_gate_7_still_energy
     g8:
       move_energy:
         name: Gate 8 Movement Energy
+        id: ${devicename_cleared}_gate_8_movement_energy
       still_energy:
         name: Gate 8 Still Energy
+        id: ${devicename_cleared}_gate_8_still_energy
 
 switch:
   - platform: ld2410
     engineering_mode:
       name: "Engineering Mode"
-      id: "engineering_mode"
+      id: ${devicename_cleared}_engineering_mode
     bluetooth:
       name: "mmWave Bluetooth"
+      id: ${devicename_cleared}_bluetooth
       disabled_by_default: true
 
 number:

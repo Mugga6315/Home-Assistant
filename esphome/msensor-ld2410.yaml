@@ -20,6 +20,8 @@ ota:
 
 wifi:
 
+captive_portal:
+
 improv_serial:
 
 packages:
