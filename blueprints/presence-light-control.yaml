@@ -136,6 +136,19 @@ blueprint:
       selector:
         boolean:
 
+    additional_turn_on_condition:
+      name: Additional Turn-On Condition
+      description: >
+        Optional template condition that must evaluate to true for lights to turn on when presence is detected.
+        Leave the default ({{ true }}) to always allow turn-on.
+        Examples:
+          - {{ states('sensor.washer_power') | float < 5 }}
+          - {{ is_state('input_boolean.guests_mode', 'off') }}
+          - {{ states('sensor.illuminance') | float < 200 }}
+      default: "{{ true }}"
+      selector:
+        template:
+
 variables:
   target_lights: !input target_lights
   light_var_name: !input light_variable_name
@@ -167,7 +180,7 @@ variables:
   per_light_map: >
     {% set ns = namespace(result={}) %}
     {% for entry in per_light_brightness %}
-      {% if entry.entity_id is defined %}
+      {% if entry is mapping and entry.entity_id is defined %}
         {% set ns.result = ns.result | combine({
           entry.entity_id: {
             'day_brightness': entry.get('day_brightness', default_brightness),
@@ -223,11 +236,15 @@ trigger:
     id: periodic_check
 
 action:
-  # Global guard: abort if light_changed was caused by another automation
+  # Global guard: abort if light_changed was caused by this or another automation within the last 5s.
+  # Uses time_since_last as the debounce; user_id is not none confirms a human action.
+  # Manual detection in the choose block relies on this guard having already filtered automation changes.
   - condition: template
     value_template: >
       {% if trigger.id == 'light_changed' %}
-        {{ trigger.to_state.context.parent_id is none or trigger.to_state.context.user_id is not none }}
+        {% set last_action = light_vars.get('last_action', '2000-01-01') %}
+        {% set time_since_last = as_timestamp(now()) - as_timestamp(last_action) %}
+        {{ trigger.to_state.context.user_id is not none or time_since_last > 5 }}
       {% else %}
         {{ true }}
       {% endif %}
@@ -240,6 +257,9 @@ action:
           - condition: template
             value_template: "{{ not override_active }}"
         sequence:
+          - condition: template
+            value_template: !input additional_turn_on_condition
+
           - event: set_variable
             event_data:
               key: "{{ light_var_name }}"
@@ -298,18 +318,13 @@ action:
               entity_id: "{{ lights_list }}"
 
       # MANUAL CONTROL DETECTED
+      # Global guard above already filtered automation-caused changes, so any light_changed
+      # reaching here is user-initiated.
       - conditions:
           - condition: trigger
             id: light_changed
           - condition: template
             value_template: "{{ detect_manual }}"
-          - condition: template
-            value_template: >
-              {% set context_user = trigger.to_state.context.user_id %}
-              {% set context_parent = trigger.to_state.context.parent_id %}
-              {% set last_action = light_vars.get('last_action', '2000-01-01') %}
-              {% set time_since_last = as_timestamp(now()) - as_timestamp(last_action) %}
-              {{ (context_user is not none) or (context_parent is none and time_since_last > 5) }}
         sequence:
           - event: set_variable
             event_data:
@@ -325,7 +340,7 @@ action:
           - condition: trigger
             id: periodic_check
           - condition: template
-            value_template: "{{ override_active }}"
+            value_template: "{{ light_vars.get('override_active', false) }}"
           - condition: template
             value_template: >
               {% set override_until = light_vars.get('override_until', '') %}
@@ -338,5 +353,40 @@ action:
                 override_active: false
                 override_until: ""
                 last_action: "{{ now().isoformat() }}"
+
+          - if:
+              - condition: template
+                value_template: >
+                  {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+            then:
+              # Presence still active — restore automation brightness
+              - repeat:
+                  for_each: "{{ lights_list }}"
+                  sequence:
+                    - variables:
+                        this_light: "{{ repeat.item }}"
+                        this_brightness: >
+                          {% if is_night %}
+                            {{ per_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
+                          {% else %}
+                            {{ per_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
+                          {% endif %}
+                    - service: light.turn_on
+                      target:
+                        entity_id: "{{ this_light }}"
+                      data:
+                        brightness: "{{ this_brightness }}"
+            else:
+              # No presence — turn off lights
+              - event: set_variable
+                event_data:
+                  key: "{{ light_var_name }}"
+                  value:
+                    presence_state: "off"
+                    last_action: "{{ now().isoformat() }}"
+                    last_triggered_by: "override_expired"
+              - service: light.turn_off
+                target:
+                  entity_id: "{{ lights_list }}"
 
 mode: restart
