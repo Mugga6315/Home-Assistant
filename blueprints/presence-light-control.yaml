@@ -1,0 +1,299 @@
+blueprint:
+  name: Presence Light Control
+  description: Simple presence-based light automation using sensor.light_variables
+  domain: automation
+  input:
+    target_light:
+      name: Light Entity
+      selector:
+        entity:
+          domain: light
+
+    light_variable_name:
+      name: Light Variable Name
+      description: Name in sensor.light_variables (e.g., 'kitchen', 'bedroom')
+      selector:
+        text:
+
+    presence_sensors:
+      name: Presence Sensors
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - occupancy
+            - motion
+          multiple: true
+
+    state_variable:
+      name: State Storage Variable
+      default: sensor.light_variables
+      selector:
+        entity:
+          domain: sensor
+
+    no_presence_timeout:
+      name: No Presence Timeout (seconds)
+      default: 5
+      selector:
+        number:
+          min: 5
+          max: 3600
+          step: 5
+
+    default_brightness:
+      name: Default Brightness
+      default: 255
+      selector:
+        number:
+          min: 1
+          max: 255
+          step: 1
+
+    enable_brightness_control:
+      name: Enable Brightness Control
+      description: Use different brightness levels for day/night
+      default: false
+      selector:
+        boolean:
+
+    night_mode_type:
+      name: Night Mode Detection
+      description: How to determine when to use lower brightness
+      default: time
+      selector:
+        select:
+          options:
+            - label: Time-based (start/end time)
+              value: time
+            - label: Sensor-based (binary sensor state)
+              value: sensor
+          mode: dropdown
+
+    night_sensor:
+      name: Night Mode Sensor
+      description: Binary sensor that indicates night mode (on = night)
+      default:
+      selector:
+        entity:
+          domain: binary_sensor
+
+    night_start:
+      name: Night Start Time
+      default: "22:00:00"
+      selector:
+        time:
+
+    night_end:
+      name: Night End Time
+      default: "06:00:00"
+      selector:
+        time:
+
+    night_brightness:
+      name: Night Brightness
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 255
+          step: 1
+
+    override_timeout:
+      name: Manual Override Duration (minutes)
+      description: How long manual control blocks automation
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+
+    detect_manual_control:
+      name: Detect Manual Control
+      description: Pause automation when light is manually controlled
+      default: true
+      selector:
+        boolean:
+
+variables:
+  target_light: !input target_light
+  light_var_name: !input light_variable_name
+  state_var: !input state_variable
+  presence_sensors: !input presence_sensors
+  timeout: !input no_presence_timeout
+  default_brightness: !input default_brightness
+  brightness_control: !input enable_brightness_control
+  night_mode_type: !input night_mode_type
+  night_sensor: !input night_sensor
+  night_start: !input night_start
+  night_end: !input night_end
+  night_brightness: !input night_brightness
+  override_timeout_minutes: !input override_timeout
+  override_timeout: "{{ override_timeout_minutes * 60 }}"
+  detect_manual: !input detect_manual_control
+
+  # Get light variables
+  all_variables: "{{ state_attr(state_var, 'variables') | default({}) }}"
+  light_vars: "{{ all_variables.get(light_var_name, {}) }}"
+
+  # Check if it's night time
+  is_night: >
+    {% if brightness_control %}
+      {% if night_mode_type == 'sensor' and night_sensor %}
+        {{ is_state(night_sensor, 'on') }}
+      {% else %}
+        {% set current_time = now().strftime('%H:%M:%S') %}
+        {% if night_start > night_end %}
+          {{ current_time >= night_start or current_time < night_end }}
+        {% else %}
+          {{ current_time >= night_start and current_time < night_end }}
+        {% endif %}
+      {% endif %}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+  # Calculate brightness to use
+  active_brightness: >
+    {% if is_night %}
+      {{ light_vars.get('night_brightness', night_brightness) }}
+    {% else %}
+      {{ light_vars.get('day_brightness', default_brightness) }}
+    {% endif %}
+
+  # Check if override is active
+  override_active: >
+    {% set override = light_vars.get('override_active', false) %}
+    {% set override_until = light_vars.get('override_until', '') %}
+    {% if override and override_until %}
+      {{ as_timestamp(now()) < as_timestamp(override_until) }}
+    {% else %}
+      {{ false }}
+    {% endif %}
+
+trigger:
+  - platform: state
+    entity_id: !input presence_sensors
+    to: "on"
+    id: presence_on
+
+  - platform: state
+    entity_id: !input presence_sensors
+    to: "off"
+    id: presence_off
+
+  - platform: state
+    entity_id: !input target_light
+    id: light_changed
+
+  - platform: time_pattern
+    minutes: "/1"
+    id: periodic_check
+
+action:
+  - choose:
+      # PRESENCE DETECTED - TURN ON
+      - conditions:
+          - condition: trigger
+            id: presence_on
+          - condition: template
+            value_template: "{{ not override_active }}"
+        sequence:
+          - event: set_variable
+            event_data:
+              key: "{{ light_var_name }}"
+              value:
+                brightness: "{{ active_brightness }}"
+                day_brightness: "{{ light_vars.get('day_brightness', default_brightness) }}"
+                night_brightness: "{{ light_vars.get('night_brightness', night_brightness) }}"
+                last_presence: "{{ now().isoformat() }}"
+                presence_state: "on"
+                last_action: "{{ now().isoformat() }}"
+                last_triggered_by: "{{ trigger.entity_id }}"
+
+          - service: light.turn_on
+            target:
+              entity_id: !input target_light
+            data:
+              brightness: "{{ active_brightness }}"
+
+      # PRESENCE CLEARED - WAIT AND TURN OFF
+      - conditions:
+          - condition: trigger
+            id: presence_off
+          - condition: template
+            value_template: "{{ not override_active }}"
+        sequence:
+          - delay:
+              seconds: "{{ timeout }}"
+
+          - condition: template
+            value_template: >
+              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
+
+          - event: set_variable
+            event_data:
+              key: "{{ light_var_name }}"
+              value:
+                brightness: "{{ light_vars.get('brightness', active_brightness) }}"
+                day_brightness: "{{ light_vars.get('day_brightness', default_brightness) }}"
+                night_brightness: "{{ light_vars.get('night_brightness', night_brightness) }}"
+                last_presence: "{{ now().isoformat() }}"
+                presence_state: "off"
+                last_action: "{{ now().isoformat() }}"
+                last_triggered_by: "timeout"
+
+          - service: light.turn_off
+            target:
+              entity_id: !input target_light
+
+      # MANUAL CONTROL DETECTED
+      - conditions:
+          - condition: trigger
+            id: light_changed
+          - condition: template
+            value_template: "{{ detect_manual }}"
+          - condition: template
+            value_template: >
+              {% set context_user = trigger.to_state.context.user_id %}
+              {% set context_parent = trigger.to_state.context.parent_id %}
+              {% set last_action = light_vars.get('last_action', '2000-01-01') %}
+              {% set time_since_last = as_timestamp(now()) - as_timestamp(last_action) %}
+              {{ (context_user is not none) or (context_parent is none and time_since_last > 5) }}
+        sequence:
+          - event: set_variable
+            event_data:
+              key: "{{ light_var_name }}"
+              value:
+                brightness: "{{ state_attr(target_light, 'brightness') | int(255) }}"
+                day_brightness: "{{ light_vars.get('day_brightness', default_brightness) }}"
+                night_brightness: "{{ light_vars.get('night_brightness', night_brightness) }}"
+                override_active: true
+                override_until: "{{ (now() + timedelta(seconds=override_timeout)).isoformat() }}"
+                last_action: "{{ now().isoformat() }}"
+                last_triggered_by: "manual"
+
+      # PERIODIC CHECK - CLEAR EXPIRED OVERRIDES
+      - conditions:
+          - condition: trigger
+            id: periodic_check
+          - condition: template
+            value_template: "{{ override_active }}"
+          - condition: template
+            value_template: >
+              {% set override_until = light_vars.get('override_until', '') %}
+              {{ override_until and (as_timestamp(now()) >= as_timestamp(override_until)) }}
+        sequence:
+          - event: set_variable
+            event_data:
+              key: "{{ light_var_name }}"
+              value:
+                brightness: "{{ light_vars.get('brightness', active_brightness) }}"
+                day_brightness: "{{ light_vars.get('day_brightness', default_brightness) }}"
+                night_brightness: "{{ light_vars.get('night_brightness', night_brightness) }}"
+                override_active: false
+                override_until: null
+                last_action: "{{ now().isoformat() }}"
+
+mode: restart
