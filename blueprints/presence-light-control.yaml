@@ -27,6 +27,19 @@ blueprint:
             - motion
           multiple: true
 
+    motion_sensor:
+      name: Motion Sensor (Optional)
+      description: >
+        Optional motion sensor that acts as an additional gate.
+        When set, presence alone won't trigger lights — motion must also be active.
+        The motion sensor itself also acts as a trigger.
+      default:
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - motion
+
     state_variable:
       name: State Storage Variable
       default: sensor.light_variables
@@ -166,6 +179,8 @@ variables:
   override_timeout_minutes: !input override_timeout
   override_timeout: "{{ override_timeout_minutes * 60 }}"
   detect_manual: !input detect_manual_control
+  motion_sensor: !input motion_sensor
+  has_motion_sensor: "{{ motion_sensor not in [none, '', 'None'] }}"
 
   all_variables: "{{ state_attr(state_var, 'variables') | default({}) }}"
   light_vars: "{{ all_variables.get(light_var_name, {}) }}"
@@ -216,6 +231,9 @@ variables:
       {{ false }}
     {% endif %}
 
+trigger_variables:
+  motion_sensor_entity: !input motion_sensor
+
 trigger:
   - platform: state
     entity_id: !input presence_sensors
@@ -226,6 +244,12 @@ trigger:
     entity_id: !input presence_sensors
     to: "off"
     id: presence_off
+
+  - platform: template
+    value_template: >
+      {{ motion_sensor_entity not in [none, '', 'None'] and
+         is_state(motion_sensor_entity, 'on') }}
+    id: motion_on
 
   - platform: state
     entity_id: !input target_lights
@@ -253,10 +277,28 @@ action:
       # PRESENCE DETECTED
       - conditions:
           - condition: trigger
-            id: presence_on
+            id:
+              - presence_on
+              - motion_on
           - condition: template
             value_template: "{{ not override_active }}"
         sequence:
+          # Wait for both sensors to settle (handles motion firing before presence or vice versa)
+          - if:
+              - condition: template
+                value_template: "{{ has_motion_sensor }}"
+            then:
+              - wait_template: >
+                  {{ is_state(motion_sensor, 'on') and
+                     expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+                timeout:
+                  seconds: 3
+              - condition: template
+                value_template: "{{ wait.completed }}"
+            else:
+              - condition: template
+                value_template: >
+                  {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
           - condition: template
             value_template: !input additional_turn_on_condition
 
