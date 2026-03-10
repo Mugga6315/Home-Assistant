@@ -1,6 +1,11 @@
 blueprint:
-  name: Presence Light Control
-  description: Presence-based light automation with per-light brightness control using sensor.light_variables
+  name: Zone-Aware Presence Light Control
+  description: >
+    Presence-based light automation that adjusts brightness per-zone.
+    Each zone sensor maps to a brightness level per light — when multiple zones
+    are active, the highest priority zone wins. Uses zone sensors directly for
+    on/off detection so the automation is self-contained and not affected by
+    unrelated sensors elsewhere in the house.
   domain: automation
   input:
     target_lights:
@@ -11,8 +16,12 @@ blueprint:
           domain: light
           multiple: true
 
-    presence_sensors:
-      name: Presence Sensors
+    zone_sensors:
+      name: Zone Sensors
+      description: >
+        All individual presence/occupancy sensors to watch. These are the
+        ESPHome mmWave sensors already exposed to HA (e.g. binary_sensor.msensor_flur_occupancy).
+        When any of these is on, lights turn on. When all are off, lights turn off.
       selector:
         entity:
           domain: binary_sensor
@@ -21,18 +30,37 @@ blueprint:
             - motion
           multiple: true
 
-    motion_sensor:
-      name: Motion Sensor (Optional)
+    zone_rules:
+      name: Zone Rules
       description: >
-        Optional motion sensor that acts as an additional gate.
-        When set, presence alone won't trigger lights — motion must also be active.
-        The motion sensor itself also acts as a trigger.
-      default:
+        List of zone-to-brightness mappings. When multiple zones are active,
+        the rule with the highest priority wins.
+
+        Example:
+          - zone_sensors:
+              - binary_sensor.msensor_flur_occupancy
+            priority: 10
+            per_light:
+              - entity_id: light.corridor_1
+                day_brightness: 255
+                night_brightness: 150
+              - entity_id: light.corridor_2
+                day_brightness: 200
+                night_brightness: 100
+          - zone_sensors:
+              - binary_sensor.msensor_wohnzimmer_occupancy
+              - binary_sensor.msensor_wc_occupancy
+            priority: 5
+            per_light:
+              - entity_id: light.corridor_1
+                day_brightness: 51
+                night_brightness: 30
+              - entity_id: light.corridor_2
+                day_brightness: 127
+                night_brightness: 60
+      default: []
       selector:
-        entity:
-          domain: binary_sensor
-          device_class:
-            - motion
+        object:
 
     state_variable:
       name: State Storage Variable
@@ -51,7 +79,8 @@ blueprint:
           step: 5
 
     default_brightness:
-      name: Default Day Brightness (all lights)
+      name: Default Day Brightness
+      description: Fallback brightness when no zone rule matches
       default: 255
       selector:
         number:
@@ -100,31 +129,13 @@ blueprint:
         time:
 
     night_brightness:
-      name: Default Night Brightness (all lights)
+      name: Default Night Brightness
       default: 100
       selector:
         number:
           min: 1
           max: 255
           step: 1
-
-    per_light_brightness:
-      name: Per-Light Brightness Overrides
-      description: >
-        Override day/night brightness for specific lights.
-        Must be a list — each entry requires entity_id, day_brightness, and night_brightness.
-        Lights not listed use the global Default Day/Night Brightness values above.
-
-        Example:
-          - entity_id: light.kitchen_main
-            day_brightness: 255
-            night_brightness: 80
-          - entity_id: light.kitchen_cabinet
-            day_brightness: 180
-            night_brightness: 40
-      default: []
-      selector:
-        object:
 
     override_timeout:
       name: Manual Override Duration (minutes)
@@ -146,12 +157,8 @@ blueprint:
     additional_turn_on_condition:
       name: Additional Turn-On Condition
       description: >
-        Optional template condition that must evaluate to true for lights to turn on when presence is detected.
+        Optional template condition that must evaluate to true for lights to turn on.
         Leave the default ({{ true }}) to always allow turn-on.
-        Examples:
-          - {{ states('sensor.washer_power') | float < 5 }}
-          - {{ is_state('input_boolean.guests_mode', 'off') }}
-          - {{ states('sensor.illuminance') | float < 200 }}
       default: "{{ true }}"
       selector:
         template:
@@ -160,7 +167,8 @@ variables:
   target_lights: !input target_lights
   light_var_name: "{{ this.entity_id }}"
   state_var: !input state_variable
-  presence_sensors: !input presence_sensors
+  zone_sensors: !input zone_sensors
+  zone_rules: !input zone_rules
   timeout: !input no_presence_timeout
   default_brightness: !input default_brightness
   brightness_control: !input enable_brightness_control
@@ -169,12 +177,9 @@ variables:
   night_start: !input night_start
   night_end: !input night_end
   night_brightness: !input night_brightness
-  per_light_brightness: !input per_light_brightness
   override_timeout_minutes: !input override_timeout
   override_timeout: "{{ override_timeout_minutes * 60 }}"
   detect_manual: !input detect_manual_control
-  motion_sensor: !input motion_sensor
-  has_motion_sensor: "{{ motion_sensor not in [none, '', 'None'] }}"
 
   all_variables: "{{ state_attr(state_var, 'variables') | default({}) }}"
   light_vars: "{{ all_variables.get(light_var_name, {}) }}"
@@ -185,20 +190,6 @@ variables:
     {% else %}
       {{ target_lights }}
     {% endif %}
-
-  per_light_map: >
-    {% set ns = namespace(result={}) %}
-    {% for entry in per_light_brightness %}
-      {% if entry is mapping and entry.entity_id is defined %}
-        {% set ns.result = ns.result | combine({
-          entry.entity_id: {
-            'day_brightness': entry.get('day_brightness', default_brightness),
-            'night_brightness': entry.get('night_brightness', night_brightness)
-          }
-        }) %}
-      {% endif %}
-    {% endfor %}
-    {{ ns.result }}
 
   is_night: >
     {% if brightness_control %}
@@ -225,25 +216,39 @@ variables:
       {{ false }}
     {% endif %}
 
-trigger_variables:
-  motion_sensor_entity: !input motion_sensor
+  # Highest-priority active zone's per_light list
+  active_zone_per_light: >
+    {% set ns = namespace(best=-1, result=[]) %}
+    {% for rule in zone_rules %}
+      {% set sensors = rule.zone_sensors | default([]) %}
+      {% set any_on = expand(sensors) | selectattr('state', 'eq', 'on') | list | count > 0 %}
+      {% set prio = rule.priority | default(0) | int %}
+      {% if any_on and prio > ns.best %}
+        {% set ns.best = prio %}
+        {% set ns.result = rule.per_light | default([]) %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.result }}
+
+  # Map of entity_id → {day_brightness, night_brightness} from winning zone
+  zone_light_map: >
+    {% set ns = namespace(result={}) %}
+    {% for entry in active_zone_per_light %}
+      {% if entry is mapping and entry.entity_id is defined %}
+        {% set ns.result = ns.result | combine({
+          entry.entity_id: {
+            'day_brightness': entry.day_brightness | default(default_brightness),
+            'night_brightness': entry.night_brightness | default(night_brightness)
+          }
+        }) %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.result }}
 
 trigger:
   - platform: state
-    entity_id: !input presence_sensors
-    to: "on"
-    id: presence_on
-
-  - platform: state
-    entity_id: !input presence_sensors
-    to: "off"
-    id: presence_off
-
-  - platform: template
-    value_template: >
-      {{ motion_sensor_entity not in [none, '', 'None'] and
-         is_state(motion_sensor_entity, 'on') }}
-    id: motion_on
+    entity_id: !input zone_sensors
+    id: zone_changed
 
   - platform: state
     entity_id: !input target_lights
@@ -254,9 +259,8 @@ trigger:
     id: periodic_check
 
 action:
-  # Global guard: for light_changed triggers, only proceed if the change was caused by a human
-  # (context.user_id is set). Automation-triggered changes always have user_id = none and are
-  # dropped here, preventing mode:restart from canceling in-progress presence-off delays.
+  # Global guard: drop automation-triggered light_changed events.
+  # Only human actions (context.user_id set) pass through.
   - condition: template
     value_template: >
       {% if trigger.id == 'light_changed' %}
@@ -266,90 +270,99 @@ action:
       {% endif %}
 
   - choose:
-      # PRESENCE DETECTED
+      # ANY ZONE BECAME OCCUPIED
       - conditions:
           - condition: trigger
-            id:
-              - presence_on
-              - motion_on
+            id: zone_changed
+          - condition: template
+            value_template: >
+              {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
           - condition: template
             value_template: "{{ not override_active }}"
         sequence:
           - if:
+              # Only turn on if automation hasn't already turned them on
               - condition: template
-                value_template: "{{ has_motion_sensor }}"
+                value_template: "{{ light_vars.get('presence_state', 'off') == 'off' }}"
             then:
-              - if:
-                  - condition: trigger
-                    id: motion_on
-                then:
-                  # PIR triggered: wait briefly for a presence sensor to confirm.
-                  # PIR is already on (it caused this trigger), so only presence is awaited.
-                  - wait_template: >
-                      {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
-                    timeout:
-                      seconds: 3
-                  - condition: template
-                    value_template: "{{ wait.completed }}"
-                else:
-                  # Presence triggered: PIR must be currently active to gate the turn-on.
-                  # If PIR is off, presence alone is not enough to turn on lights.
-                  - condition: template
-                    value_template: "{{ is_state(motion_sensor, 'on') }}"
-            else:
               - condition: template
-                value_template: >
-                  {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
-          - condition: template
-            value_template: !input additional_turn_on_condition
+                value_template: !input additional_turn_on_condition
 
-          - event: set_variable
-            event_data:
-              key: "{{ light_var_name }}"
-              value:
-                last_presence: "{{ now().isoformat() }}"
-                presence_state: "on"
-                last_action: "{{ now().isoformat() }}"
-                last_triggered_by: "{{ trigger.entity_id }}"
-                override_active: false
-                override_until: ""
+              - event: set_variable
+                event_data:
+                  key: "{{ light_var_name }}"
+                  value:
+                    last_presence: "{{ now().isoformat() }}"
+                    presence_state: "on"
+                    last_action: "{{ now().isoformat() }}"
+                    last_triggered_by: "{{ trigger.entity_id }}"
+                    override_active: false
+                    override_until: ""
 
-          - repeat:
-              for_each: "{{ lights_list }}"
-              sequence:
-                - variables:
-                    this_light: "{{ repeat.item }}"
-                    this_brightness: >
-                      {% if is_night %}
-                        {{ per_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
-                      {% else %}
-                        {{ per_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
-                      {% endif %}
-                - service: light.turn_on
-                  target:
-                    entity_id: "{{ this_light }}"
-                  data:
-                    brightness: "{{ this_brightness }}"
+              - repeat:
+                  for_each: "{{ lights_list }}"
+                  sequence:
+                    - variables:
+                        this_light: "{{ repeat.item }}"
+                        this_brightness: >
+                          {% if is_night %}
+                            {{ zone_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
+                          {% else %}
+                            {{ zone_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
+                          {% endif %}
+                    - service: light.turn_on
+                      target:
+                        entity_id: "{{ this_light }}"
+                      data:
+                        brightness: "{{ this_brightness }}"
 
-      # PRESENCE CLEARED
+            else:
+              # Lights already on — zone changed, update brightness only
+              - repeat:
+                  for_each: "{{ lights_list }}"
+                  sequence:
+                    - variables:
+                        this_light: "{{ repeat.item }}"
+                        this_brightness: >
+                          {% if is_night %}
+                            {{ zone_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
+                          {% else %}
+                            {{ zone_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
+                          {% endif %}
+                    - service: light.turn_on
+                      target:
+                        entity_id: "{{ this_light }}"
+                      data:
+                        brightness: "{{ this_brightness }}"
+
+      # ALL ZONES CLEARED
       - conditions:
           - condition: trigger
-            id: presence_off
+            id: zone_changed
+          - condition: template
+            value_template: >
+              {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
           - condition: template
             value_template: "{{ not override_active }}"
         sequence:
-          - delay:
-              seconds: "{{ timeout }}"
-
-          - condition: template
-            value_template: >
-              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
-
           - event: set_variable
             event_data:
               key: "{{ light_var_name }}"
               value:
                 last_presence: "{{ now().isoformat() }}"
+
+          - delay:
+              seconds: "{{ timeout }}"
+
+          # Re-check: no zone should have come back during the delay
+          - condition: template
+            value_template: >
+              {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
+
+          - event: set_variable
+            event_data:
+              key: "{{ light_var_name }}"
+              value:
                 presence_state: "off"
                 last_action: "{{ now().isoformat() }}"
                 last_triggered_by: "timeout"
@@ -361,8 +374,6 @@ action:
               entity_id: "{{ lights_list }}"
 
       # MANUAL CONTROL DETECTED
-      # Only trigger on actual human actions - require user_id to be set.
-      # This ensures automation-triggered state changes are never treated as manual control.
       - conditions:
           - condition: trigger
             id: light_changed
@@ -402,7 +413,7 @@ action:
           - if:
               - condition: template
                 value_template: >
-                  {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+                  {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
             then:
               # Presence still active — restore automation brightness
               - repeat:
@@ -412,9 +423,9 @@ action:
                         this_light: "{{ repeat.item }}"
                         this_brightness: >
                           {% if is_night %}
-                            {{ per_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
+                            {{ zone_light_map.get(this_light, {}).get('night_brightness', night_brightness) }}
                           {% else %}
-                            {{ per_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
+                            {{ zone_light_map.get(this_light, {}).get('day_brightness', default_brightness) }}
                           {% endif %}
                     - service: light.turn_on
                       target:
@@ -435,11 +446,8 @@ action:
                   entity_id: "{{ lights_list }}"
 
       # PERIODIC CHECK - RECOVERY
-      # Catches the case where the presence-off delay was canceled by a mode:restart
-      # (e.g., by the periodic_check itself or a human light change that set the override
-      # but presence already cleared before override was activated).
-      # Conditions: no active override, presence has been gone longer than the timeout,
-      # and at least one managed light is still on.
+      # Guards against presence-off delays canceled by mode:restart.
+      # Fires when: no override, all zones clear for longer than timeout, light still on.
       - conditions:
           - condition: trigger
             id: periodic_check
@@ -447,7 +455,7 @@ action:
             value_template: "{{ not light_vars.get('override_active', false) }}"
           - condition: template
             value_template: >
-              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
+              {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
           - condition: template
             value_template: >
               {{ expand(lights_list) | selectattr('state', 'eq', 'on') | list | count > 0 }}
