@@ -46,9 +46,9 @@ blueprint:
       default: 5
       selector:
         number:
-          min: 5
+          min: 0
           max: 300
-          step: 5
+          step: 1
 
     default_brightness:
       name: Default Day Brightness (all lights)
@@ -285,12 +285,13 @@ action:
                 then:
                   # PIR triggered: wait briefly for a presence sensor to confirm.
                   # PIR is already on (it caused this trigger), so only presence is awaited.
+                  # continue_on_timeout: false ensures the sequence aborts on timeout —
+                  # do not rely solely on wait.completed being false.
                   - wait_template: >
                       {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
                     timeout:
                       seconds: 3
-                  - condition: template
-                    value_template: "{{ wait.completed }}"
+                    continue_on_timeout: false
                 else:
                   # Presence triggered: PIR must be currently active to gate the turn-on.
                   # If PIR is off, presence alone is not enough to turn on lights.

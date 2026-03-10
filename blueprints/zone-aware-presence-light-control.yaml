@@ -32,32 +32,30 @@ blueprint:
 
     zone_rules:
       name: Zone Rules
-      description: >
-        List of zone-to-brightness mappings. When multiple zones are active,
-        the rule with the highest priority wins.
+      description: >-
+        List of zone-to-brightness mappings. When multiple zones are active, the rule with the highest priority wins. Paste the following as a starting point and adjust entity IDs and brightness values:
 
-        Example:
-          - zone_sensors:
-              - binary_sensor.msensor_flur_occupancy
-            priority: 10
-            per_light:
-              - entity_id: light.corridor_1
-                day_brightness: 255
-                night_brightness: 150
-              - entity_id: light.corridor_2
-                day_brightness: 200
-                night_brightness: 100
-          - zone_sensors:
-              - binary_sensor.msensor_wohnzimmer_occupancy
-              - binary_sensor.msensor_wc_occupancy
-            priority: 5
-            per_light:
-              - entity_id: light.corridor_1
-                day_brightness: 51
-                night_brightness: 30
-              - entity_id: light.corridor_2
-                day_brightness: 127
-                night_brightness: 60
+        - zone_sensors:
+            - binary_sensor.msensor_flur_occupancy
+          priority: 10
+          per_light:
+            - entity_id: light.corridor_1
+              day_brightness: 255
+              night_brightness: 150
+            - entity_id: light.corridor_2
+              day_brightness: 200
+              night_brightness: 100
+        - zone_sensors:
+            - binary_sensor.msensor_wohnzimmer_occupancy
+            - binary_sensor.msensor_wc_occupancy
+          priority: 5
+          per_light:
+            - entity_id: light.corridor_1
+              day_brightness: 51
+              night_brightness: 30
+            - entity_id: light.corridor_2
+              day_brightness: 127
+              night_brightness: 60
       default: []
       selector:
         object:
@@ -71,10 +69,10 @@ blueprint:
 
     no_presence_timeout:
       name: No Presence Timeout (seconds)
-      default: 5
+      default: 0
       selector:
         number:
-          min: 5
+          min: 0
           max: 300
           step: 5
 
