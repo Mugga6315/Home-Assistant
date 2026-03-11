@@ -29,6 +29,7 @@ sensor:
   - platform: ld2410
     light:
       name: mmWave Light
+      id: ${devicename_cleared}_light
       disabled_by_default: true
     moving_distance:
       name: Moving Target Distance
@@ -123,90 +124,121 @@ number:
   - platform: ld2410
     timeout:
       name: Occupancy Off Delay
+      id: ${devicename_cleared}_timeout
     light_threshold:
       name: mmWave Light Threshold
+      id: ${devicename_cleared}_light_threshold
       disabled_by_default: True
     max_move_distance_gate:
       name: Max Movement Distance Gate
+      id: ${devicename_cleared}_max_move_distance_gate
     max_still_distance_gate:
       name: Max Still Distance Gate
+      id: ${devicename_cleared}_max_still_distance_gate
     g0:
       move_threshold:
         name: Gate 0 Movement Sensitivity
+        id: ${devicename_cleared}_gate_0_move_threshold
       still_threshold:
         name: Gate 0 Still Sensitivity
+        id: ${devicename_cleared}_gate_0_still_threshold
     g1:
       move_threshold:
         name: Gate 1 Movement Sensitivity
+        id: ${devicename_cleared}_gate_1_move_threshold
       still_threshold:
         name: Gate 1 Still Sensitivity
+        id: ${devicename_cleared}_gate_1_still_threshold
     g2:
       move_threshold:
         name: Gate 2 Movement Sensitivity
+        id: ${devicename_cleared}_gate_2_move_threshold
       still_threshold:
         name: Gate 2 Still Sensitivity
+        id: ${devicename_cleared}_gate_2_still_threshold
     g3:
       move_threshold:
         name: Gate 3 Movement Sensitivity
+        id: ${devicename_cleared}_gate_3_move_threshold
       still_threshold:
         name: Gate 3 Still Sensitivity
+        id: ${devicename_cleared}_gate_3_still_threshold
     g4:
       move_threshold:
         name: Gate 4 Movement Sensitivity
+        id: ${devicename_cleared}_gate_4_move_threshold
       still_threshold:
         name: Gate 4 Still Sensitivity
+        id: ${devicename_cleared}_gate_4_still_threshold
     g5:
       move_threshold:
         name: Gate 5 Movement Sensitivity
+        id: ${devicename_cleared}_gate_5_move_threshold
       still_threshold:
         name: Gate 5 Still Sensitivity
+        id: ${devicename_cleared}_gate_5_still_threshold
     g6:
       move_threshold:
         name: Gate 6 Movement Sensitivity
+        id: ${devicename_cleared}_gate_6_move_threshold
       still_threshold:
         name: Gate 6 Still Sensitivity
+        id: ${devicename_cleared}_gate_6_still_threshold
     g7:
       move_threshold:
         name: Gate 7 Movement Sensitivity
+        id: ${devicename_cleared}_gate_7_move_threshold
       still_threshold:
         name: Gate 7 Still Sensitivity
+        id: ${devicename_cleared}_gate_7_still_threshold
     g8:
       move_threshold:
         name: Gate 8 Movement Sensitivity
+        id: ${devicename_cleared}_gate_8_move_threshold
       still_threshold:
         name: Gate 8 Still Sensitivity
+        id: ${devicename_cleared}_gate_8_still_threshold
 
 button:
   - platform: ld2410
     factory_reset:
       name: "Factory Reset mmWave"
+      id: ${devicename_cleared}_factory_reset
       disabled_by_default: true
     restart:
       name: "Restart mmWave"
+      id: ${devicename_cleared}_restart
       disabled_by_default: true
     query_params:
       name: Get Values
+      id: ${devicename_cleared}_query_params
       disabled_by_default: true
 
 text_sensor:
   - platform: ld2410
     version:
       name: "mmWave Firmware Version"
+      id: ${devicename_cleared}_version
     mac_address:
       name: "mmWave MAC Address"
+      id: ${devicename_cleared}_mac_address
       disabled_by_default: true
 
 select:
   - platform: ld2410
     distance_resolution:
       name: "Distance Gate Resolution"
+      id: ${devicename_cleared}_distance_resolution
       disabled_by_default: true
     baud_rate:
       name: "mmWave Sensor Baud Rate"
+      id: ${devicename_cleared}_baud_rate
       disabled_by_default: true
     light_function:
       name: mmWave Light Function
+      id: ${devicename_cleared}_light_function
       disabled_by_default: true
     out_pin_level:
       name: GPIO Pin Level
+      id: ${devicename_cleared}_out_pin_level
       disabled_by_default: true
