@@ -254,13 +254,17 @@ trigger:
     id: periodic_check
 
 action:
-  # Global guard: for light_changed triggers, only proceed if the change was caused by a human
-  # (context.user_id is set). Automation-triggered changes always have user_id = none and are
-  # dropped here, preventing mode:restart from canceling in-progress presence-off delays.
+  # Global guard: skip light_changed events caused by this automation.
+  # This automation always sets a parent_id when it controls lights.
+  # External sources (other automations, scripts, voice assistants) have parent_id = none.
+  # Direct user interactions have user_id set.
+  # We only skip when parent_id is set AND user_id is none — i.e. caused by an automation/script
+  # that is NOT a direct user action. This prevents mode:restart loops from presence-off delays.
   - condition: template
-    value_template: >
+    value_template: |
       {% if trigger.id == 'light_changed' %}
-        {{ trigger.to_state.context.user_id is not none }}
+        {% set ctx = trigger.to_state.context %}
+        {{ not (ctx.parent_id is not none and ctx.user_id is none) }}
       {% else %}
         {{ true }}
       {% endif %}
@@ -283,24 +287,19 @@ action:
                   - condition: trigger
                     id: motion_on
                 then:
-                  # PIR triggered: wait briefly for a presence sensor to confirm.
-                  # PIR is already on (it caused this trigger), so only presence is awaited.
-                  # continue_on_timeout: false ensures the sequence aborts on timeout —
-                  # do not rely solely on wait.completed being false.
                   - wait_template: >
                       {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
                     timeout:
                       seconds: 3
                     continue_on_timeout: false
                 else:
-                  # Presence triggered: PIR must be currently active to gate the turn-on.
-                  # If PIR is off, presence alone is not enough to turn on lights.
                   - condition: template
                     value_template: "{{ is_state(motion_sensor, 'on') }}"
             else:
               - condition: template
                 value_template: >
                   {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+
           - condition: template
             value_template: !input additional_turn_on_condition
 
@@ -362,15 +361,14 @@ action:
               entity_id: "{{ lights_list }}"
 
       # MANUAL CONTROL DETECTED
-      # Only trigger on actual human actions - require user_id to be set.
-      # This ensures automation-triggered state changes are never treated as manual control.
+      # Catches both direct user interactions (user_id set) and external triggers
+      # from other automations/scripts/voice assistants (both user_id and parent_id are none).
+      # Changes made by this automation are already filtered out by the global guard above.
       - conditions:
           - condition: trigger
             id: light_changed
           - condition: template
             value_template: "{{ detect_manual }}"
-          - condition: template
-            value_template: "{{ trigger.to_state.context.user_id is not none }}"
         sequence:
           - event: set_variable
             event_data:
@@ -405,7 +403,6 @@ action:
                 value_template: >
                   {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
             then:
-              # Presence still active — restore automation brightness
               - repeat:
                   for_each: "{{ lights_list }}"
                   sequence:
@@ -423,7 +420,6 @@ action:
                       data:
                         brightness: "{{ this_brightness }}"
             else:
-              # No presence — turn off lights
               - event: set_variable
                 event_data:
                   key: "{{ light_var_name }}"
@@ -436,11 +432,7 @@ action:
                   entity_id: "{{ lights_list }}"
 
       # PERIODIC CHECK - RECOVERY
-      # Catches the case where the presence-off delay was canceled by a mode:restart
-      # (e.g., by the periodic_check itself or a human light change that set the override
-      # but presence already cleared before override was activated).
-      # Conditions: no active override, presence has been gone longer than the timeout,
-      # and at least one managed light is still on.
+      # Catches lights left on after presence-off delay was interrupted by mode:restart.
       - conditions:
           - condition: trigger
             id: periodic_check
