@@ -1,0 +1,392 @@
+blueprint:
+  name: Music Presence Control
+  description: >
+    Manages media playback based on room presence. When everyone leaves while music
+    is playing, gradually lowers volume, pauses, then stops. If someone returns
+    within the resume window, playback resumes at the original volume.
+  domain: automation
+  input:
+    media_player:
+      name: Media Player
+      description: The media player to control
+      selector:
+        entity:
+          domain: media_player
+
+    presence_sensors:
+      name: Presence Sensors
+      description: One or more presence/occupancy sensors for the room
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - occupancy
+            - motion
+          multiple: true
+
+    volume_reduce_percent:
+      name: Volume Reduction (%)
+      description: How much to reduce volume by (relative to current volume)
+      default: 50
+      selector:
+        number:
+          min: 10
+          max: 90
+          step: 5
+          unit_of_measurement: "%"
+
+    volume_lower_delay:
+      name: Delay Before Lowering Volume (seconds)
+      description: How long to wait after presence is lost before lowering volume
+      default: 120
+      selector:
+        number:
+          min: 0
+          max: 600
+          step: 5
+          unit_of_measurement: seconds
+
+    pause_delay:
+      name: Delay Before Pausing (seconds)
+      description: How long to wait after lowering volume before pausing playback
+      default: 180
+      selector:
+        number:
+          min: 0
+          max: 600
+          step: 5
+          unit_of_measurement: seconds
+
+    resume_window:
+      name: Resume Window (seconds)
+      description: How long to keep paused before stopping (return within this window to resume)
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 900
+          step: 10
+          unit_of_measurement: seconds
+
+    state_variable_sensor:
+      name: State Storage Variable
+      description: Sensor entity used to persist state between runs
+      default: sensor.music_variables
+      selector:
+        entity:
+          domain: sensor
+
+    debug_logging:
+      name: Debug Logging
+      description: Enable debug log messages (written at error level to system_log)
+      default: false
+      selector:
+        boolean:
+
+mode: single
+
+trigger:
+  - platform: state
+    entity_id: !input presence_sensors
+    to: "off"
+    id: presence_off
+
+variables:
+  media_player_entity: !input media_player
+  presence_sensors: !input presence_sensors
+  volume_reduce_pct: !input volume_reduce_percent
+  vol_lower_delay: !input volume_lower_delay
+  pause_delay_secs: !input pause_delay
+  resume_window_secs: !input resume_window
+  state_var: !input state_variable_sensor
+  debug: !input debug_logging
+  var_key: "{{ this.entity_id }}"
+  any_presence: >
+    {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+
+action:
+  # ── GATE: all presence must be off AND media must be playing ──
+  - condition: template
+    value_template: >
+      {{ not any_presence }}
+
+  - condition: template
+    value_template: >
+      {{ is_state(media_player_entity, 'playing') }}
+
+  # ── STORE original volume and mark as managed ──
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ debug }}"
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MUSIC_PRESENCE: storing state — player={{ media_player_entity }},
+                volume={{ state_attr(media_player_entity, 'volume_level') }}
+              level: error
+
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        original_volume: "{{ state_attr(media_player_entity, 'volume_level') | float }}"
+        managed: true
+
+  # ── PHASE 1: Wait before lowering volume ──
+  - wait_template: >
+      {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    timeout:
+      seconds: "{{ vol_lower_delay }}"
+    continue_on_timeout: true
+
+  # Re-check: presence returned → clear state and stop (no volume change was made yet)
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: presence returned during phase 1, aborting"
+                      level: error
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Presence returned before volume change"
+
+  # Check media is still playing (manual stop detection)
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ not is_state(media_player_entity, 'playing') }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: media stopped externally during phase 1, clearing state"
+                      level: error
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Media stopped externally"
+
+  # Lower volume
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ debug }}"
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MUSIC_PRESENCE: lowering volume on {{ media_player_entity }}
+              level: error
+
+  - service: media_player.volume_set
+    target:
+      entity_id: "{{ media_player_entity }}"
+    data:
+      volume_level: >
+        {% set vars = (state_attr(state_var, 'variables') | default({})).get(var_key, {}) %}
+        {{ (vars.get('original_volume', 0) | float * (1 - volume_reduce_pct / 100)) | round(2) }}
+
+  # ── PHASE 2: Wait before pausing ──
+  - wait_template: >
+      {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    timeout:
+      seconds: "{{ pause_delay_secs }}"
+    continue_on_timeout: true
+
+  # Re-check: presence returned → restore volume and stop
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: presence returned during phase 2, restoring volume"
+                      level: error
+          - service: media_player.volume_set
+            target:
+              entity_id: "{{ media_player_entity }}"
+            data:
+              volume_level: >
+                {% set vars = (state_attr(state_var, 'variables') | default({})).get(var_key, {}) %}
+                {{ vars.get('original_volume', 0) | float }}
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Presence returned, volume restored"
+
+  # Re-check: media stopped externally → restore volume, clear state
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ not is_state(media_player_entity, 'playing') }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: media stopped externally during phase 2, clearing state"
+                      level: error
+          - service: media_player.volume_set
+            target:
+              entity_id: "{{ media_player_entity }}"
+            data:
+              volume_level: >
+                {% set vars = (state_attr(state_var, 'variables') | default({})).get(var_key, {}) %}
+                {{ vars.get('original_volume', 0) | float }}
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Media stopped externally"
+
+  # Pause playback and restore volume (ducking only applies during phase 2)
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ debug }}"
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MUSIC_PRESENCE: pausing {{ media_player_entity }}, restoring volume
+              level: error
+
+  - service: media_player.media_pause
+    target:
+      entity_id: "{{ media_player_entity }}"
+
+  - service: media_player.volume_set
+    target:
+      entity_id: "{{ media_player_entity }}"
+    data:
+      volume_level: >
+        {% set vars = (state_attr(state_var, 'variables') | default({})).get(var_key, {}) %}
+        {{ vars.get('original_volume', 0) | float }}
+
+  # ── PHASE 3: Resume window ──
+  - wait_template: >
+      {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    timeout:
+      seconds: "{{ resume_window_secs }}"
+    continue_on_timeout: true
+
+  # Re-check: presence returned → resume (volume already restored)
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: presence returned during phase 3, resuming playback"
+                      level: error
+          - service: media_player.media_play
+            target:
+              entity_id: "{{ media_player_entity }}"
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Presence returned, playback resumed"
+
+  # Re-check: media no longer paused (someone stopped it) → clear state
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ not is_state(media_player_entity, 'paused') }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: "MUSIC_PRESENCE: media no longer paused during phase 3, clearing state"
+                      level: error
+          - event: set_variable
+            event_data:
+              entity: "{{ state_var }}"
+              key: "{{ var_key }}"
+              value:
+                managed: false
+                original_volume: 0
+          - stop: "Media stopped externally during resume window"
+
+  # Abandon: stop playback and clear state (volume already restored after pause)
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ debug }}"
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MUSIC_PRESENCE: resume window expired, stopping {{ media_player_entity }}
+              level: error
+
+  - service: media_player.media_stop
+    target:
+      entity_id: "{{ media_player_entity }}"
+
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        managed: false
+        original_volume: 0
