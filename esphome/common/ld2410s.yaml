@@ -1,0 +1,69 @@
+external_components:
+  - source:
+      type: git
+      url: https://github.com/Mugga6315/Home-Assistant
+      ref: main
+    components: [ld2410s]
+    refresh: 0s
+
+uart:
+  id: uart_bus
+  baud_rate: 115200
+  tx_pin: RX
+  rx_pin: TX
+  parity: NONE
+  stop_bits: 1
+
+ld2410s:
+  uart_id: uart_bus
+
+binary_sensor:
+  - platform: ld2410s
+    has_target:
+      name: Occupancy
+      id: ${devicename_cleared}_occupancy
+
+sensor:
+  - platform: ld2410s
+    target_distance:
+      name: Detection Distance
+      id: ${devicename_cleared}_detection_distance
+
+number:
+  - platform: ld2410s
+    no_delay:
+      name: Occupancy Off Delay
+      id: ${devicename_cleared}_no_delay
+    max_distance:
+      name: Max Distance Gate
+      id: ${devicename_cleared}_max_distance
+    min_distance:
+      name: Min Distance Gate
+      id: ${devicename_cleared}_min_distance
+    status_reporting_frequency:
+      name: Status Report Frequency
+      id: ${devicename_cleared}_status_reporting_frequency
+    distance_reporting_frequency:
+      name: Distance Report Frequency
+      id: ${devicename_cleared}_distance_reporting_frequency
+
+select:
+  - platform: ld2410s
+    response_speed:
+      name: Response Speed
+      id: ${devicename_cleared}_response_speed
+
+button:
+  - platform: ld2410s
+    apply_config:
+      name: Apply Config
+      id: ${devicename_cleared}_apply_config
+    auto_threshold:
+      name: Auto Threshold
+      id: ${devicename_cleared}_auto_threshold
+
+text_sensor:
+  - platform: ld2410s
+    fw_version:
+      name: "mmWave Firmware Version"
+      id: ${devicename_cleared}_firmware_version
