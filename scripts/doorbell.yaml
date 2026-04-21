@@ -1,0 +1,238 @@
+alias: Doorbell
+description: ""
+sequence:
+  - parallel:
+      - data:
+          title: Haustür
+          message: Ding Dong
+          data:
+            ttl: 0
+            priority: high
+            channel: Doorbell
+        enabled: true
+        action: notify.notify
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.any_presence
+                state: "on"
+            sequence:
+              - variables:
+                  wled_flur_was_off: "{{ states('light.wled_flur') == 'off' }}"
+                  wled_tv_wand_was_off: "{{ states('light.wled_tv_wand') == 'off' }}"
+                  wled_werkbank_was_off: "{{ states('light.wled_werkbank') == 'off' }}"
+              - data:
+                  snapshot_entities:
+                    - light.buro
+                  scene_id: temp_lights_bell
+                action: scene.create
+              - action: light.turn_on
+                target:
+                  entity_id:
+                    - light.wled_flur
+                    - light.wled_tv_wand
+                    - light.wled_werkbank
+              - delay:
+                  milliseconds: 500
+              - variables:
+                  wled_flur_preset: "{{ states('select.wled_flur_preset') }}"
+                  wled_flur_effect: "{{ state_attr('light.wled_flur', 'effect') }}"
+                  wled_flur_brightness: "{{ state_attr('light.wled_flur', 'brightness') | default(128, true) }}"
+                  wled_flur_rgb: "{{ state_attr('light.wled_flur', 'rgb_color') }}"
+                  wled_tv_wand_preset: "{{ states('select.wled_tv_wand_preset') }}"
+                  wled_tv_wand_effect: "{{ state_attr('light.wled_tv_wand', 'effect') }}"
+                  wled_tv_wand_brightness: "{{ state_attr('light.wled_tv_wand', 'brightness') | default(128, true) }}"
+                  wled_tv_wand_rgb: "{{ state_attr('light.wled_tv_wand', 'rgb_color') }}"
+                  wled_werkbank_preset: "{{ states('select.wled_werkbank_preset') }}"
+                  wled_werkbank_effect: "{{ state_attr('light.wled_werkbank', 'effect') }}"
+                  wled_werkbank_brightness: "{{ state_attr('light.wled_werkbank', 'brightness') | default(128, true) }}"
+                  wled_werkbank_rgb: "{{ state_attr('light.wled_werkbank', 'rgb_color') }}"
+                  invalid_presets:
+                    - "None"
+                    - "none"
+                    - "Unknown"
+                    - "unknown"
+                    - "unavailable"
+                    - ""
+              - delay:
+                  milliseconds: 300
+              - parallel:
+                  - if:
+                      - condition: state
+                        entity_id: binary_sensor.msensor_buero_occupancy
+                        state: "on"
+                    then:
+                      - action: light.turn_on
+                        target:
+                          entity_id: light.buro
+                        data:
+                          flash: short
+                  - action: select.select_option
+                    target:
+                      entity_id: select.wled_flur_preset
+                    data:
+                      option: "Two Dots"
+                  - action: select.select_option
+                    target:
+                      entity_id: select.wled_tv_wand_preset
+                    data:
+                      option: "Two Dots"
+                  - action: select.select_option
+                    target:
+                      entity_id: select.wled_werkbank_preset
+                    data:
+                      option: "Two Dots"
+              - delay:
+                  hours: 0
+                  minutes: 0
+                  seconds: 5
+                  milliseconds: 0
+              - action: scene.turn_on
+                target:
+                  entity_id: scene.temp_lights_bell
+              - delay:
+                  milliseconds: 300
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_flur_was_off and wled_flur_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_flur_preset
+                        data:
+                          option: "{{ wled_flur_preset }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_flur
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_flur_was_off }}"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: light.wled_flur
+                        data:
+                          effect: "{{ wled_flur_effect }}"
+                          brightness: "{{ wled_flur_brightness | int }}"
+                          rgb_color: "{{ wled_flur_rgb }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_flur
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_flur_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_flur_preset
+                        data:
+                          option: "{{ wled_flur_preset }}"
+                default:
+                  - action: light.turn_on
+                    target:
+                      entity_id: light.wled_flur
+                    data:
+                      effect: "{{ wled_flur_effect }}"
+                      brightness: "{{ wled_flur_brightness | int }}"
+                      rgb_color: "{{ wled_flur_rgb }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_tv_wand_was_off and wled_tv_wand_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_tv_wand_preset
+                        data:
+                          option: "{{ wled_tv_wand_preset }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_tv_wand
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_tv_wand_was_off }}"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: light.wled_tv_wand
+                        data:
+                          effect: "{{ wled_tv_wand_effect }}"
+                          brightness: "{{ wled_tv_wand_brightness | int }}"
+                          rgb_color: "{{ wled_tv_wand_rgb }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_tv_wand
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_tv_wand_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_tv_wand_preset
+                        data:
+                          option: "{{ wled_tv_wand_preset }}"
+                default:
+                  - action: light.turn_on
+                    target:
+                      entity_id: light.wled_tv_wand
+                    data:
+                      effect: "{{ wled_tv_wand_effect }}"
+                      brightness: "{{ wled_tv_wand_brightness | int }}"
+                      rgb_color: "{{ wled_tv_wand_rgb }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_werkbank_was_off and wled_werkbank_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_werkbank_preset
+                        data:
+                          option: "{{ wled_werkbank_preset }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_werkbank
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_werkbank_was_off }}"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: light.wled_werkbank
+                        data:
+                          effect: "{{ wled_werkbank_effect }}"
+                          brightness: "{{ wled_werkbank_brightness | int }}"
+                          rgb_color: "{{ wled_werkbank_rgb }}"
+                      - delay:
+                          milliseconds: 300
+                      - action: light.turn_off
+                        target:
+                          entity_id: light.wled_werkbank
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wled_werkbank_preset not in invalid_presets }}"
+                    sequence:
+                      - action: select.select_option
+                        target:
+                          entity_id: select.wled_werkbank_preset
+                        data:
+                          option: "{{ wled_werkbank_preset }}"
+                default:
+                  - action: light.turn_on
+                    target:
+                      entity_id: light.wled_werkbank
+                    data:
+                      effect: "{{ wled_werkbank_effect }}"
+                      brightness: "{{ wled_werkbank_brightness | int }}"
+                      rgb_color: "{{ wled_werkbank_rgb }}"
