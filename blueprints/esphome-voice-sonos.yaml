@@ -1,0 +1,63 @@
+blueprint:
+  name: ESPHome Voice - Sonos Announcements
+  description: >
+    Plays wake word chime and TTS announcements on a Sonos speaker
+    when triggered by an ESPHome voice device.
+  domain: automation
+  input:
+    esphome_device_id:
+      name: ESPHome Voice Device
+      description: The ESPHome device that emits wake word and TTS events.
+      selector:
+        device:
+          integration: esphome
+    media_player:
+      name: Sonos Speaker
+      description: Speaker to play wake word chime and TTS announcements on.
+      selector:
+        entity:
+          domain: media_player
+    wake_word_sound_url:
+      name: Wake Word Sound URL
+      description: Audio file played when wake word is detected.
+      default: >-
+        https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+      selector:
+        text:
+
+triggers:
+  - trigger: event
+    event_type: esphome.wake_word_detected
+    event_data:
+      device_id: !input esphome_device_id
+    id: wake_word
+  - trigger: event
+    event_type: esphome.tts_uri
+    event_data:
+      device_id: !input esphome_device_id
+    id: tts_uri
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: wake_word
+        sequence:
+          - action: media_player.play_media
+            target:
+              entity_id: !input media_player
+            data:
+              announce: true
+              media_content_id: !input wake_word_sound_url
+              media_content_type: music
+      - conditions:
+          - condition: trigger
+            id: tts_uri
+        sequence:
+          - action: music_assistant.play_announcement
+            target:
+              entity_id: !input media_player
+            data:
+              url: "{{ trigger.event.data.uri }}"
+
+mode: parallel
