@@ -249,9 +249,9 @@ trigger:
     entity_id: !input target_lights
     id: light_changed
 
-  - platform: time_pattern
-    minutes: "/1"
-    id: periodic_check
+  - platform: event
+    event_type: presence_override_expired
+    id: override_expired
 
 action:
   # Re-read sensor state fresh at action-execution time (not trigger time).
@@ -431,16 +431,12 @@ action:
                 last_action: "{{ now().isoformat() }}"
                 last_triggered_by: "manual"
 
-      # PERIODIC CHECK - CLEAR EXPIRED OVERRIDES
+      # OVERRIDE EXPIRED - fired by global presence-override-cleanup automation
       - conditions:
           - condition: trigger
-            id: periodic_check
+            id: override_expired
           - condition: template
-            value_template: "{{ fresh_vars.get('override_active', false) }}"
-          - condition: template
-            value_template: >
-              {% set override_until = fresh_vars.get('override_until', '') %}
-              {{ override_until and (as_timestamp(now()) >= as_timestamp(override_until)) }}
+            value_template: "{{ trigger.event.data.key == light_var_name }}"
         sequence:
           - event: set_variable
             event_data:
@@ -455,7 +451,6 @@ action:
                 value_template: >
                   {{ expand(presence_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
             then:
-              # Stamp before turning lights back on after override expiry.
               - event: set_variable
                 event_data:
                   key: "{{ light_var_name }}"

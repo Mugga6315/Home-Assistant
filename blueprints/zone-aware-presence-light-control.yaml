@@ -252,9 +252,9 @@ trigger:
     entity_id: !input target_lights
     id: light_changed
 
-  - platform: time_pattern
-    minutes: "/1"
-    id: periodic_check
+  - platform: event
+    event_type: presence_override_expired
+    id: override_expired
 
 action:
   # Global guard: drop automation-triggered light_changed events.
@@ -389,16 +389,12 @@ action:
                 last_action: "{{ now().isoformat() }}"
                 last_triggered_by: "manual"
 
-      # PERIODIC CHECK - CLEAR EXPIRED OVERRIDES
+      # OVERRIDE EXPIRED - fired by global presence-override-cleanup automation
       - conditions:
           - condition: trigger
-            id: periodic_check
+            id: override_expired
           - condition: template
-            value_template: "{{ light_vars.get('override_active', false) }}"
-          - condition: template
-            value_template: >
-              {% set override_until = light_vars.get('override_until', '') %}
-              {{ override_until and (as_timestamp(now()) >= as_timestamp(override_until)) }}
+            value_template: "{{ trigger.event.data.key == light_var_name }}"
         sequence:
           - event: set_variable
             event_data:
@@ -413,7 +409,6 @@ action:
                 value_template: >
                   {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
             then:
-              # Presence still active — restore automation brightness
               - repeat:
                   for_each: "{{ lights_list }}"
                   sequence:
@@ -431,7 +426,6 @@ action:
                       data:
                         brightness: "{{ this_brightness }}"
             else:
-              # No presence — turn off lights
               - event: set_variable
                 event_data:
                   key: "{{ light_var_name }}"
@@ -442,39 +436,5 @@ action:
               - service: light.turn_off
                 target:
                   entity_id: "{{ lights_list }}"
-
-      # PERIODIC CHECK - RECOVERY
-      # Guards against presence-off delays canceled by mode:restart.
-      # Fires when: no override, all zones clear for longer than timeout, light still on.
-      - conditions:
-          - condition: trigger
-            id: periodic_check
-          - condition: template
-            value_template: "{{ not light_vars.get('override_active', false) }}"
-          - condition: template
-            value_template: >
-              {{ expand(zone_sensors) | selectattr('state', 'eq', 'on') | list | count == 0 }}
-          - condition: template
-            value_template: >
-              {{ expand(lights_list) | selectattr('state', 'eq', 'on') | list | count > 0 }}
-          - condition: template
-            value_template: >
-              {% set last_presence = light_vars.get('last_presence', '') %}
-              {% if last_presence %}
-                {{ as_timestamp(now()) - as_timestamp(last_presence) >= timeout }}
-              {% else %}
-                {{ false }}
-              {% endif %}
-        sequence:
-          - event: set_variable
-            event_data:
-              key: "{{ light_var_name }}"
-              value:
-                presence_state: "off"
-                last_action: "{{ now().isoformat() }}"
-                last_triggered_by: "periodic_recovery"
-          - service: light.turn_off
-            target:
-              entity_id: "{{ lights_list }}"
 
 mode: restart
