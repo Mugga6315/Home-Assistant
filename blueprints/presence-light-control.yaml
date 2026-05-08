@@ -176,9 +176,6 @@ variables:
   motion_sensor: !input motion_sensor
   has_motion_sensor: "{{ motion_sensor not in [none, '', 'None'] }}"
 
-  all_variables: "{{ state_attr(state_var, 'variables') | default({}) }}"
-  light_vars: "{{ all_variables.get(light_var_name, {}) }}"
-
   lights_list: >
     {% if target_lights is string %}
       {{ [target_lights] }}
@@ -216,15 +213,6 @@ variables:
       {{ false }}
     {% endif %}
 
-  override_active: >
-    {% set override = light_vars.get('override_active', false) %}
-    {% set override_until = light_vars.get('override_until', '') %}
-    {% if override and override_until %}
-      {{ as_timestamp(now()) < as_timestamp(override_until) }}
-    {% else %}
-      {{ false }}
-    {% endif %}
-
 trigger_variables:
   motion_sensor_entity: !input motion_sensor
 
@@ -254,16 +242,11 @@ trigger:
     id: override_expired
 
 action:
-  # Re-read sensor state fresh at action-execution time (not trigger time).
-  # Under mode:queued, top-level variables are evaluated when the trigger fires — potentially
-  # before a previous run's set_variable event handler has updated the sensor. Reading fresh
-  # here ensures override_active and guard signals reflect the latest committed state.
+  # Re-read sensor state fresh at action-execution time. Under mode:queued, top-level
+  # variables evaluate at trigger time — potentially before the previous run's set_variable
+  # event handler updated the sensor.
   - variables:
-      my_ctx_id: "{{ context.id }}"
       fresh_vars: "{{ (state_attr(state_var, 'variables') | default({})).get(light_var_name, {}) }}"
-      last_auto_ts: "{{ fresh_vars.get('last_auto_action_ts', 0) | float }}"
-      last_auto_ctx: "{{ fresh_vars.get('last_auto_ctx', '') }}"
-      expected: "{{ fresh_vars.get('expected_state', {}) }}"
       current_override_active: >
         {% set override = fresh_vars.get('override_active', false) %}
         {% set override_until = fresh_vars.get('override_until', '') %}
@@ -272,35 +255,6 @@ action:
         {% else %}
           {{ false }}
         {% endif %}
-
-  # Three-signal guard for "is this light_changed event caused by this automation?"
-  # Skip the run if ANY signal matches:
-  #   1. context.id match — trigger's parent or own context matches this run OR the last auto-action context
-  #   2. time-window + expected-state match — within 3s of our last light call AND actual state ≈ what we set
-  # Signal 1 is authoritative when chain is intact; signal 2 catches cases where HA forks contexts
-  # (set_variable events, device drivers, delays). state_match gates the time-window path so a user
-  # flipping the light coincidentally inside the window is NOT misclassified as automation-caused.
-  - condition: template
-    value_template: |
-      {% if trigger.id == 'light_changed' %}
-        {% set p = trigger.to_state.context.parent_id %}
-        {% set c = trigger.to_state.context.id %}
-        {% set since = now().timestamp() - last_auto_ts %}
-        {% set ctx_match = p == my_ctx_id or c == my_ctx_id
-                           or (last_auto_ctx and (p == last_auto_ctx or c == last_auto_ctx)) %}
-        {% set in_window = since < 3.0 %}
-        {% set ent = trigger.to_state.entity_id %}
-        {% set exp = expected.get(ent, {}) %}
-        {% set exp_b = exp.get('brightness', -1) %}
-        {% set exp_on = exp.get('onoff', '') %}
-        {% set act_b = trigger.to_state.attributes.get('brightness', -1) %}
-        {% set act_on = trigger.to_state.state %}
-        {% set state_match = exp_on == act_on and
-                             (exp_b == -1 or (act_b is not none and (act_b - exp_b) | abs <= 5)) %}
-        {{ not (ctx_match or (in_window and state_match)) }}
-      {% else %}
-        {{ true }}
-      {% endif %}
 
   - choose:
       # PRESENCE DETECTED
@@ -336,8 +290,10 @@ action:
           - condition: template
             value_template: !input additional_turn_on_condition
 
-          # Stamp last_auto_action_ts/ctx/expected_state BEFORE the light calls so the
-          # three-signal guard recognizes the resulting light_changed events as ours.
+          # Stamp expected_onoff BEFORE the light calls. light_changed events that
+          # leave state matching expected_onoff are automation-caused (or just
+          # brightness/color adjustments) and ignored. State divergence means
+          # the user toggled the light → register override.
           - event: set_variable
             event_data:
               key: "{{ light_var_name }}"
@@ -348,15 +304,7 @@ action:
                 last_triggered_by: "{{ trigger.entity_id }}"
                 override_active: false
                 override_until: ""
-                last_auto_action_ts: "{{ now().timestamp() }}"
-                last_auto_ctx: "{{ my_ctx_id }}"
-                expected_state: >
-                  {% set ns = namespace(m={}) %}
-                  {% for l in lights_list %}
-                    {% set b = per_light_map.get(l, {}).get('night_brightness' if is_night else 'day_brightness', night_brightness if is_night else default_brightness) %}
-                    {% set ns.m = ns.m | combine({l: {'onoff': 'on', 'brightness': b}}) %}
-                  {% endfor %}
-                  {{ ns.m }}
+                expected_onoff: "on"
 
           - repeat:
               for_each: "{{ lights_list }}"
@@ -399,29 +347,32 @@ action:
                 last_triggered_by: "timeout"
                 override_active: false
                 override_until: ""
-                last_auto_action_ts: "{{ now().timestamp() }}"
-                last_auto_ctx: "{{ my_ctx_id }}"
-                expected_state: >
-                  {% set ns = namespace(m={}) %}
-                  {% for l in lights_list %}
-                    {% set ns.m = ns.m | combine({l: {'onoff': 'off', 'brightness': -1}}) %}
-                  {% endfor %}
-                  {{ ns.m }}
+                expected_onoff: "off"
 
           - service: light.turn_off
             target:
               entity_id: "{{ lights_list }}"
 
       # MANUAL CONTROL DETECTED
-      # Catches both direct user interactions (user_id set) and external triggers
-      # from other automations/scripts/voice assistants (both user_id and parent_id are none).
-      # Changes made by this automation are already filtered out by the global guard above.
+      # Filter automation's own light_changed events by comparing new state to
+      # expected_onoff. Match → automation event (or brightness/color tweak) → ignore.
+      # Mismatch → user toggled → register override. The settle delay lets the
+      # in-flight set_variable from the acting branch land in the sensor first.
       - conditions:
           - condition: trigger
             id: light_changed
           - condition: template
             value_template: "{{ detect_manual }}"
         sequence:
+          - delay:
+              milliseconds: 250
+          - variables:
+              settled_vars: "{{ (state_attr(state_var, 'variables') | default({})).get(light_var_name, {}) }}"
+              expected_onoff: "{{ settled_vars.get('expected_onoff', '') }}"
+              new_state: "{{ trigger.to_state.state }}"
+              user_toggled: "{{ expected_onoff != '' and expected_onoff != new_state }}"
+          - condition: template
+            value_template: "{{ user_toggled }}"
           - event: set_variable
             event_data:
               key: "{{ light_var_name }}"
@@ -458,15 +409,7 @@ action:
                     presence_state: "on"
                     last_action: "{{ now().isoformat() }}"
                     last_triggered_by: "override_expired"
-                    last_auto_action_ts: "{{ now().timestamp() }}"
-                    last_auto_ctx: "{{ my_ctx_id }}"
-                    expected_state: >
-                      {% set ns = namespace(m={}) %}
-                      {% for l in lights_list %}
-                        {% set b = per_light_map.get(l, {}).get('night_brightness' if is_night else 'day_brightness', night_brightness if is_night else default_brightness) %}
-                        {% set ns.m = ns.m | combine({l: {'onoff': 'on', 'brightness': b}}) %}
-                      {% endfor %}
-                      {{ ns.m }}
+                    expected_onoff: "on"
               - repeat:
                   for_each: "{{ lights_list }}"
                   sequence:
@@ -491,14 +434,7 @@ action:
                     presence_state: "off"
                     last_action: "{{ now().isoformat() }}"
                     last_triggered_by: "override_expired"
-                    last_auto_action_ts: "{{ now().timestamp() }}"
-                    last_auto_ctx: "{{ my_ctx_id }}"
-                    expected_state: >
-                      {% set ns = namespace(m={}) %}
-                      {% for l in lights_list %}
-                        {% set ns.m = ns.m | combine({l: {'onoff': 'off', 'brightness': -1}}) %}
-                      {% endfor %}
-                      {{ ns.m }}
+                    expected_onoff: "off"
               - service: light.turn_off
                 target:
                   entity_id: "{{ lights_list }}"
