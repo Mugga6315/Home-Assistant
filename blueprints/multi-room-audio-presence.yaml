@@ -1,0 +1,431 @@
+blueprint:
+  name: Multi-Room Audio Presence Control
+  description: >
+    Multi-room audio with per-room volume ducking based on presence.
+
+    By default each presence sensor and media player is matched to a room via
+    `area_id()`. Sensors that live in a room with no media player of its own
+    can be routed to a specific player using the optional sensor → player
+    override map.
+
+    Behavior:
+      - Player whose room (or override target) has presence → user's chosen volume.
+      - Player whose room has no presence → ducked to a near-mute level.
+      - No presence anywhere for `pause_delay` seconds → all players paused.
+      - Presence returns after pause → players resume, provided the last
+        observed playback is within `auto_resume_window_minutes`. Outside that
+        window, the user must manually play once to re-arm auto-resume.
+
+    The "normal" volume per player is NOT configured in the blueprint. It is
+    captured from the player's current volume right before the player is ducked,
+    and restored when the room becomes active again or when the global pause
+    fires.
+
+    State is persisted in a sensor (default `sensor.music_variables`) via the
+    `set_variable` event pattern. Requires the `set_variable` handling automation
+    to be installed.
+  domain: automation
+  input:
+    presence_sensors:
+      name: Presence Sensors
+      description: >
+        Occupancy/motion sensors. Each should be assigned to an area, unless it
+        is listed in the sensor → player override map below.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - occupancy
+            - motion
+            - presence
+          multiple: true
+
+    media_players:
+      name: Media Players
+      description: >
+        Per-room players. Each must be assigned to an area. Volume ducking is
+        applied to these individually so each room can have its own level.
+      selector:
+        entity:
+          domain: media_player
+          multiple: true
+
+    sensor_to_player_overrides:
+      name: Sensor → Player Overrides (optional)
+      description: >
+        Map a presence sensor to a specific media player, overriding the default
+        area-based matching. Use this for sensors in rooms that have no media
+        player of their own (for example, a hallway sensor that should activate
+        the kitchen player). Format is a YAML mapping of sensor entity IDs to
+        player entity IDs:
+
+          binary_sensor.hallway_motion: media_player.kitchen
+          binary_sensor.bathroom_motion: media_player.bedroom
+
+        Sensors not listed here continue to use area-based matching. The target
+        player must also appear in the Media Players input above.
+      default: {}
+      selector:
+        object:
+
+    playback_target:
+      name: Playback Target (optional)
+      description: >
+        Optional single media_player used for play/pause/state checks — typically
+        a Music Assistant or Sonos group that holds the players above. Leave empty
+        to play/pause each player individually (use this when each room has its
+        own independent music). Volume changes always target the individual
+        players regardless of this setting.
+      default: ""
+      selector:
+        entity:
+          domain: media_player
+
+    mute_volume_percent:
+      name: Ducked Volume (%)
+      description: >
+        Volume level (as a percentage) applied to rooms without presence.
+        2% is near-silent.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 1
+          unit_of_measurement: "%"
+
+    pause_delay:
+      name: Pause Delay (seconds)
+      description: How long with no presence anywhere before pausing all players.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 600
+          step: 5
+          unit_of_measurement: seconds
+
+    auto_resume_window_minutes:
+      name: Auto-Resume Window (minutes)
+      description: >
+        Maximum age, in minutes, of the last observed playback for the blueprint
+        to auto-resume on presence. If the last playback is older than this
+        (e.g. overnight), the user must manually play once to re-arm the
+        automation. Manual playback resets the clock automatically the next time
+        the blueprint runs.
+      default: 120
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          unit_of_measurement: minutes
+
+    state_variable_sensor:
+      name: State Storage Variable
+      description: Sensor entity used to persist saved per-player volumes.
+      default: sensor.music_variables
+      selector:
+        entity:
+          domain: sensor
+
+    debug_logging:
+      name: Debug Logging
+      description: Write debug messages to system_log at error level.
+      default: false
+      selector:
+        boolean:
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input presence_sensors
+    to: "on"
+    id: presence_on
+  - platform: state
+    entity_id: !input presence_sensors
+    to: "off"
+    id: presence_off
+
+variables:
+  presence_sensors: !input presence_sensors
+  media_players: !input media_players
+  overrides: !input sensor_to_player_overrides
+  playback_target_input: !input playback_target
+  mute_vol_pct: !input mute_volume_percent
+  pause_delay_secs: !input pause_delay
+  auto_resume_window_min: !input auto_resume_window_minutes
+  state_var: !input state_variable_sensor
+  debug: !input debug_logging
+  var_key: "{{ this.entity_id }}"
+
+  # Convert percentage input to the 0.0–1.0 float that media_player.volume_set expects.
+  mute_vol: "{{ (mute_vol_pct | float(0)) / 100 }}"
+
+  # Empty input → play/pause each individual player. Set → play/pause the group entity.
+  playback_entities: >
+    {{ [playback_target_input] if (playback_target_input | string | length > 0) else media_players }}
+
+  # Resolve each `on` presence sensor to one or more target players.
+  # Override map wins; otherwise fall back to matching area_id() between sensor and player.
+  active_players: >
+    {% set ns = namespace(players=[]) %}
+    {% for s in expand(presence_sensors) %}
+      {% if s.state == 'on' %}
+        {% set override = overrides.get(s.entity_id) %}
+        {% if override %}
+          {% set ns.players = ns.players + [override] %}
+        {% else %}
+          {% set a = area_id(s.entity_id) %}
+          {% if a %}
+            {% for p in media_players %}
+              {% if area_id(p) == a %}
+                {% set ns.players = ns.players + [p] %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.players | unique | list }}
+
+  my_state: >
+    {{ (state_attr(state_var, 'variables') or {}).get(var_key, {}) }}
+
+  saved_volumes: "{{ my_state.get('saved_volumes', {}) }}"
+  last_playing_iso: "{{ my_state.get('last_playing', '') }}"
+
+  any_player_active: >
+    {{ playback_entities | map('states') | select('in', ['playing', 'paused', 'buffering']) | list | count > 0 }}
+
+  # A player is resumable if it's paused OR idle. Music Assistant transitions
+  # to 'idle' after pause (queue cleared), and 'idle' players also accept
+  # media_play to resume the last-played source — which is what the user
+  # expects when walking into the room cold.
+  any_player_resumable: >
+    {{ playback_entities | map('states') | select('in', ['paused', 'idle']) | list | count > 0 }}
+
+  # True if at least one player is currently producing audio.
+  any_player_currently_playing: >
+    {{ playback_entities | map('states') | select('in', ['playing', 'buffering']) | list | count > 0 }}
+
+  # Auto-resume gate: only resume if last observed playback is recent enough.
+  # Currently-playing keeps the gate open (no resume needed but the window
+  # stays armed). Single-expression form so the result is a clean True/False
+  # string that HA's literal_eval parses to a Python bool.
+  auto_resume_ok: >
+    {{ any_player_currently_playing or (last_playing_iso != '' and
+       (as_timestamp(now()) - as_timestamp(last_playing_iso, 0)) / 60 < auto_resume_window_min) }}
+
+  # Timestamp to persist this run. If something is currently playing, refresh
+  # to now so manual playback re-arms the window. Otherwise keep the previous
+  # value so the gate decays naturally.
+  new_last_playing: >
+    {% if any_player_currently_playing %}{{ now().isoformat() }}{% else %}{{ last_playing_iso }}{% endif %}
+
+action:
+  # ── Skip when there is nothing meaningful to do:
+  #    not currently playing, no ducked players to clean up, and last playback
+  #    too old for auto-resume. Without all three, blueprint would have nothing
+  #    to act on. ──
+  - choose:
+      - conditions:
+          - "{{ not any_player_currently_playing and saved_volumes | count == 0 and not auto_resume_ok }}"
+        sequence:
+          - choose:
+              - conditions: ["{{ debug }}"]
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: >
+                        MULTIROOM: nothing to do (no playback, no saved, last_playing={{ last_playing_iso }})
+                      level: error
+          - stop: "Nothing to do"
+
+  # ── Build per-player plan.
+  #    `pre_saved`  — written BEFORE Phase A. Includes both ducked players and
+  #                   players whose restore is still pending. Keeping pending
+  #                   restores here means a mid-Phase-A cancellation leaves the
+  #                   next run with enough info to retry the restore.
+  #    `post_saved` — written AFTER Phase A. Drops restored players (they're
+  #                   back at normal, no need to track).
+  #    Ducked players appear in both maps. Restored players appear only in
+  #    `pre_saved`. ──
+  - variables:
+      plan: >
+        {% set ns = namespace(pre_saved={}, post_saved={}, sets=[]) %}
+        {% for p in media_players %}
+          {% set is_active = p in active_players %}
+          {% set cur = state_attr(p, 'volume_level') | float(0) %}
+          {% set already = saved_volumes.get(p) %}
+          {% if is_active %}
+            {# Active player — restore if there's a saved value. Keep in
+               pre_saved so a cancelled volume_set is retried; drop from
+               post_saved once Phase A has dispatched. #}
+            {% if already is not none %}
+              {% set ns.pre_saved = ns.pre_saved | combine({p: already}) %}
+              {% set ns.sets = ns.sets + [{'entity': p, 'volume': already}] %}
+            {% endif %}
+          {% else %}
+            {# Inactive player — duck. Keep in both pre_saved and post_saved
+               so the saved "normal" volume survives until Phase B restores it. #}
+            {% set save_val = already if already is not none else cur %}
+            {% set ns.pre_saved = ns.pre_saved | combine({p: save_val}) %}
+            {% set ns.post_saved = ns.post_saved | combine({p: save_val}) %}
+            {% set ns.sets = ns.sets + [{'entity': p, 'volume': mute_vol}] %}
+          {% endif %}
+        {% endfor %}
+        {{ {'pre_saved': ns.pre_saved, 'post_saved': ns.post_saved, 'sets': ns.sets} }}
+
+  - choose:
+      - conditions: ["{{ debug }}"]
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MULTIROOM: active_players={{ active_players }},
+                sets={{ plan.sets | count }},
+                pre_saved={{ plan.pre_saved.keys() | list }},
+                post_saved={{ plan.post_saved.keys() | list }}
+              level: error
+
+  # ── Persist pre-Phase-A state.
+  #    Ducks need persist BEFORE volume_set (so cancellation doesn't lose the
+  #    "normal" volume). Restores need persist to KEEP them until volume_set
+  #    confirmed (so cancellation can retry). Both handled here. ──
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        saved_volumes: "{{ plan.pre_saved }}"
+        last_playing: "{{ new_last_playing }}"
+
+  # ── Phase A: apply per-player volume changes ──
+  - repeat:
+      for_each: "{{ plan.sets }}"
+      sequence:
+        - service: media_player.volume_set
+          target:
+            entity_id: "{{ repeat.item.entity }}"
+          data:
+            volume_level: "{{ repeat.item.volume }}"
+
+  # ── Persist post-Phase-A state. Drops restored players from saved since
+  #    their volume_set has now dispatched. ──
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        saved_volumes: "{{ plan.post_saved }}"
+        last_playing: "{{ new_last_playing }}"
+
+  # ── If presence is detected and at least one player isn't already producing
+  #    audio, send media_play. Covers both "resume after blueprint pause" and
+  #    "first walk-in with idle players" — the integration will resume its
+  #    last source when fed media_play on an idle player. ──
+  - choose:
+      - conditions:
+          - "{{ active_players | count > 0 and any_player_resumable and not any_player_currently_playing and auto_resume_ok }}"
+        sequence:
+          - choose:
+              - conditions: ["{{ debug }}"]
+                sequence:
+                  - service: system_log.write
+                    data_template:
+                      message: >
+                        MULTIROOM: presence detected, resuming playback on {{ playback_entities }}
+                        (last_playing={{ last_playing_iso }})
+                      level: error
+          - service: media_player.media_play
+            target:
+              entity_id: "{{ playback_entities }}"
+
+  # ── Phase B: presence is gone everywhere — wait, then pause all ──
+  - condition: template
+    value_template: "{{ active_players | count == 0 }}"
+
+  - condition: template
+    value_template: "{{ any_player_active }}"
+
+  - choose:
+      - conditions: ["{{ debug }}"]
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MULTIROOM: no presence — waiting {{ pause_delay_secs }}s before pause
+              level: error
+
+  - delay:
+      seconds: "{{ pause_delay_secs }}"
+
+  # ── Re-evaluate after delay (defensive; mode:restart normally cancels us) ──
+  - variables:
+      active_players_now: >
+        {% set ns = namespace(players=[]) %}
+        {% for s in expand(presence_sensors) %}
+          {% if s.state == 'on' %}
+            {% set override = overrides.get(s.entity_id) %}
+            {% if override %}
+              {% set ns.players = ns.players + [override] %}
+            {% else %}
+              {% set a = area_id(s.entity_id) %}
+              {% if a %}
+                {% for p in media_players %}
+                  {% if area_id(p) == a %}
+                    {% set ns.players = ns.players + [p] %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.players | unique | list }}
+      saved_now: >
+        {{ ((state_attr(state_var, 'variables') or {}).get(var_key, {})).get('saved_volumes', {}) }}
+
+  - condition: template
+    value_template: "{{ active_players_now | count == 0 }}"
+
+  - choose:
+      - conditions: ["{{ debug }}"]
+        sequence:
+          - service: system_log.write
+            data_template:
+              message: >
+                MULTIROOM: pausing all players, restoring {{ saved_now | count }} saved volumes
+              level: error
+
+  - service: media_player.media_pause
+    target:
+      entity_id: "{{ playback_entities }}"
+
+  # ── Let pause take effect before changing volume. media_pause is async; if
+  #    volume_set fires while audio is still playing, the user hears a brief
+  #    volume dip on the still-audible audio before pause kicks in. ──
+  - delay:
+      milliseconds: 500
+
+  # ── Restore each saved volume so the user's chosen levels survive the pause ──
+  - repeat:
+      for_each: "{{ saved_now | items | list }}"
+      sequence:
+        - service: media_player.volume_set
+          target:
+            entity_id: "{{ repeat.item[0] }}"
+          data:
+            volume_level: "{{ repeat.item[1] }}"
+
+  # ── Clear ducking state. Preserve last_playing so a return within the
+  #    auto-resume window still triggers playback. ──
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        saved_volumes: {}
+        last_playing: "{{ new_last_playing }}"
