@@ -105,6 +105,20 @@ blueprint:
           step: 5
           unit_of_measurement: seconds
 
+    fade_duration_ms:
+      name: Fade Duration (ms)
+      description: >
+        Total time, in milliseconds, to fade volume in or out. Set to 0 to
+        disable fades and apply volume changes instantly. Fade is split into
+        10 equal steps.
+      default: 2000
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 100
+          unit_of_measurement: ms
+
     auto_resume_window_minutes:
       name: Auto-Resume Window (minutes)
       description: >
@@ -156,6 +170,8 @@ variables:
   playback_target_input: !input playback_target
   mute_vol_pct: !input mute_volume_percent
   pause_delay_secs: !input pause_delay
+  fade_duration_ms: !input fade_duration_ms
+  fade_steps: 10
   auto_resume_window_min: !input auto_resume_window_minutes
   state_var: !input state_variable_sensor
   debug: !input debug_logging
@@ -266,7 +282,7 @@ action:
                post_saved once Phase A has dispatched. #}
             {% if already is not none %}
               {% set ns.pre_saved = ns.pre_saved | combine({p: already}) %}
-              {% set ns.sets = ns.sets + [{'entity': p, 'volume': already}] %}
+              {% set ns.sets = ns.sets + [{'entity': p, 'start': cur, 'volume': already}] %}
             {% endif %}
           {% else %}
             {# Inactive player — duck. Keep in both pre_saved and post_saved
@@ -274,7 +290,7 @@ action:
             {% set save_val = already if already is not none else cur %}
             {% set ns.pre_saved = ns.pre_saved | combine({p: save_val}) %}
             {% set ns.post_saved = ns.post_saved | combine({p: save_val}) %}
-            {% set ns.sets = ns.sets + [{'entity': p, 'volume': mute_vol}] %}
+            {% set ns.sets = ns.sets + [{'entity': p, 'start': cur, 'volume': mute_vol}] %}
           {% endif %}
         {% endfor %}
         {{ {'pre_saved': ns.pre_saved, 'post_saved': ns.post_saved, 'sets': ns.sets} }}
@@ -303,30 +319,11 @@ action:
         saved_volumes: "{{ plan.pre_saved }}"
         last_playing: "{{ new_last_playing }}"
 
-  # ── Phase A: apply per-player volume changes ──
-  - repeat:
-      for_each: "{{ plan.sets }}"
-      sequence:
-        - service: media_player.volume_set
-          target:
-            entity_id: "{{ repeat.item.entity }}"
-          data:
-            volume_level: "{{ repeat.item.volume }}"
-
-  # ── Persist post-Phase-A state. Drops restored players from saved since
-  #    their volume_set has now dispatched. ──
-  - event: set_variable
-    event_data:
-      entity: "{{ state_var }}"
-      key: "{{ var_key }}"
-      value:
-        saved_volumes: "{{ plan.post_saved }}"
-        last_playing: "{{ new_last_playing }}"
-
-  # ── If presence is detected and at least one player isn't already producing
-  #    audio, send media_play. Covers both "resume after blueprint pause" and
-  #    "first walk-in with idle players" — the integration will resume its
-  #    last source when fed media_play on an idle player. ──
+  # ── Resume playback FIRST (before fade) when a player is paused/idle.
+  #    Audio then begins at the player's current (ducked/low) volume and the
+  #    fade below ramps it up audibly. Order swapped from previous version,
+  #    where fade ran on silent paused audio and media_play then started at the
+  #    end-of-fade volume with no audible ramp. ──
   - choose:
       - conditions:
           - "{{ active_players | count > 0 and any_player_resumable and not any_player_currently_playing and auto_resume_ok }}"
@@ -343,6 +340,53 @@ action:
           - service: media_player.media_play
             target:
               entity_id: "{{ playback_entities }}"
+
+  # ── Phase A: apply per-player volume changes.
+  #    Fade duration > 0 → stepped linear fade over `fade_steps` iterations,
+  #    all players advancing in lock-step each tick. Fade duration = 0 → single
+  #    instant volume_set per player.
+  #
+  #    Linear ramp: vol = start + (target - start) * k / N, k=1..N.
+  #    Outer index `k` captured into a variable so it survives the inner repeat
+  #    (which shadows `repeat.*`). ──
+  - choose:
+      - conditions: ["{{ fade_duration_ms | int(0) > 0 and plan.sets | count > 0 }}"]
+        sequence:
+          - repeat:
+              count: "{{ fade_steps }}"
+              sequence:
+                - variables:
+                    k: "{{ repeat.index }}"
+                - repeat:
+                    for_each: "{{ plan.sets }}"
+                    sequence:
+                      - service: media_player.volume_set
+                        target:
+                          entity_id: "{{ repeat.item.entity }}"
+                        data:
+                          volume_level: >
+                            {{ repeat.item.start + (repeat.item.volume - repeat.item.start) * k / fade_steps }}
+                - delay:
+                    milliseconds: "{{ (fade_duration_ms | int(0) / fade_steps) | int }}"
+    default:
+      - repeat:
+          for_each: "{{ plan.sets }}"
+          sequence:
+            - service: media_player.volume_set
+              target:
+                entity_id: "{{ repeat.item.entity }}"
+              data:
+                volume_level: "{{ repeat.item.volume }}"
+
+  # ── Persist post-Phase-A state. Drops restored players from saved since
+  #    their volume_set has now dispatched. ──
+  - event: set_variable
+    event_data:
+      entity: "{{ state_var }}"
+      key: "{{ var_key }}"
+      value:
+        saved_volumes: "{{ plan.post_saved }}"
+        last_playing: "{{ new_last_playing }}"
 
   # ── Phase B: presence is gone everywhere — wait, then pause all ──
   - condition: template
