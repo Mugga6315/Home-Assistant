@@ -12,9 +12,15 @@ blueprint:
       - Player whose room (or override target) has presence → user's chosen volume.
       - Player whose room has no presence → ducked to a near-mute level.
       - No presence anywhere for `pause_delay` seconds → all players paused.
-      - Presence returns after pause → players resume, provided the last
-        observed playback is within `auto_resume_window_minutes`. Outside that
-        window, the user must manually play once to re-arm auto-resume.
+      - Presence returns after the AUTOMATION's own no-presence pause → players
+        resume, provided the last observed playback is within
+        `auto_resume_window_minutes`. Outside that window, the user must manually
+        play once to re-arm auto-resume.
+      - A MANUAL pause (by any means — Home Assistant, the Music Assistant app, a
+        vendor app, voice, a physical button) suppresses auto-resume: presence
+        will NOT resume it. Only the automation's own pause auto-resumes. The
+        distinction is tracked by an `auto_paused` flag, not by who paused — so it
+        works no matter how the pause was issued. Play once to re-arm.
 
     The "normal" volume per player is NOT configured in the blueprint. It is
     captured from the player's current volume right before the player is ducked,
@@ -182,7 +188,7 @@ variables:
 
   # Empty input → play/pause each individual player. Set → play/pause the group entity.
   playback_entities: >
-    {{ [playback_target_input] if (playback_target_input | string | length > 0) else media_players }}
+    {{ [playback_target_input] if playback_target_input else media_players }}
 
   # Resolve each `on` presence sensor to one or more target players.
   # Override map wins; otherwise fall back to matching area_id() between sensor and player.
@@ -213,6 +219,12 @@ variables:
   saved_volumes: "{{ my_state.get('saved_volumes', {}) }}"
   last_playing_iso: "{{ my_state.get('last_playing', '') }}"
 
+  # True only when the AUTOMATION itself paused playing audio (Phase B) and is
+  # therefore the owner that should auto-resume it. Manual pauses never set this,
+  # so they are never auto-resumed — regardless of how they were issued. Read
+  # defensively so a stored "False" string can't be read as truthy.
+  auto_paused: "{{ (my_state.get('auto_paused', false) | string | lower) == 'true' }}"
+
   any_player_active: >
     {{ playback_entities | map('states') | select('in', ['playing', 'paused', 'buffering']) | list | count > 0 }}
 
@@ -227,12 +239,12 @@ variables:
   any_player_currently_playing: >
     {{ playback_entities | map('states') | select('in', ['playing', 'buffering']) | list | count > 0 }}
 
-  # Auto-resume gate: only resume if last observed playback is recent enough.
-  # Currently-playing keeps the gate open (no resume needed but the window
-  # stays armed). Single-expression form so the result is a clean True/False
-  # string that HA's literal_eval parses to a Python bool.
+  # Auto-resume gate: resume only if the automation owns the pause (auto_paused)
+  # AND the last observed playback is recent enough. Currently-playing keeps the
+  # gate open (no resume needed but the window stays armed). Single-expression
+  # form so the result is a clean True/False string that HA parses to a bool.
   auto_resume_ok: >
-    {{ any_player_currently_playing or (last_playing_iso != '' and
+    {{ any_player_currently_playing or (auto_paused and last_playing_iso != '' and
        (as_timestamp(now()) - as_timestamp(last_playing_iso, 0)) / 60 < auto_resume_window_min) }}
 
   # Timestamp to persist this run. If something is currently playing, refresh
@@ -240,6 +252,12 @@ variables:
   # value so the gate decays naturally.
   new_last_playing: >
     {% if any_player_currently_playing %}{{ now().isoformat() }}{% else %}{{ last_playing_iso }}{% endif %}
+
+  # Whether this run will resume playback the automation paused. Computed once
+  # from run-start state so the resume branch and the post-Phase-A persist agree.
+  will_resume: >
+    {{ active_players | count > 0 and any_player_resumable
+       and not any_player_currently_playing and auto_resume_ok }}
 
 action:
   # ── Skip when there is nothing meaningful to do:
@@ -318,6 +336,8 @@ action:
       value:
         saved_volumes: "{{ plan.pre_saved }}"
         last_playing: "{{ new_last_playing }}"
+        # Audio playing now → not in an automation-paused state.
+        auto_paused: "{{ false if any_player_currently_playing else auto_paused }}"
 
   # ── Resume playback FIRST (before fade) when a player is paused/idle.
   #    Audio then begins at the player's current (ducked/low) volume and the
@@ -326,7 +346,7 @@ action:
   #    end-of-fade volume with no audible ramp. ──
   - choose:
       - conditions:
-          - "{{ active_players | count > 0 and any_player_resumable and not any_player_currently_playing and auto_resume_ok }}"
+          - "{{ will_resume }}"
         sequence:
           - choose:
               - conditions: ["{{ debug }}"]
@@ -387,6 +407,8 @@ action:
       value:
         saved_volumes: "{{ plan.post_saved }}"
         last_playing: "{{ new_last_playing }}"
+        # Cleared if we just resumed or audio is playing; otherwise preserved.
+        auto_paused: "{{ false if (any_player_currently_playing or will_resume) else auto_paused }}"
 
   # ── Phase B: presence is gone everywhere — wait, then pause all ──
   - condition: template
@@ -431,6 +453,12 @@ action:
         {{ ns.players | unique | list }}
       saved_now: >
         {{ ((state_attr(state_var, 'variables') or {}).get(var_key, {})).get('saved_volumes', {}) }}
+      # Evaluated just before the pause: true only if there is real playing audio
+      # for the automation to pause. This is what makes the pause "owned" (and so
+      # auto-resumable). If audio was already paused (a manual pause earlier),
+      # this is false and the automation does NOT claim it.
+      currently_playing_now: >
+        {{ playback_entities | map('states') | select('in', ['playing', 'buffering']) | list | count > 0 }}
 
   - condition: template
     value_template: "{{ active_players_now | count == 0 }}"
@@ -473,3 +501,5 @@ action:
       value:
         saved_volumes: {}
         last_playing: "{{ new_last_playing }}"
+        # The automation owns this pause only if it actually paused playing audio.
+        auto_paused: "{{ currently_playing_now }}"
