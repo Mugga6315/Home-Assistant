@@ -1,0 +1,213 @@
+# Creative Sound Blaster X4 (SB1815) control over BLE.
+#
+# Usage (in the device yaml):
+#   substitutions:
+#     x4_mac: "XX:XX:XX:XX:XX:XX"
+#   packages:
+#     soundblaster_x4: !include common/soundblaster-x4.yaml
+
+substitutions:
+  # Volume entity unit: "%" (desktop-like cubic curve) or "dB" (raw X4 value)
+  x4_volume_unit: "%"
+  x4_service: "B7860001-11B8-B681-6343-5A6C2286633F"
+  x4_write: "B7860002-11B8-B681-6343-5A6C2286633F"
+  x4_notify: "B7860003-11B8-B681-6343-5A6C2286633F"
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: ${x4_mac}
+    id: x4_ble
+    on_connect:
+      then:
+        # wait for notify registration of x4_rx before querying state
+        - delay: 1s
+        - ble_client.ble_write:
+            id: x4_ble
+            service_uuid: ${x4_service}
+            characteristic_uuid: ${x4_write}
+            value: [0x5a, 0x2c, 0x01, 0x01] # output
+        - delay: 200ms
+        - ble_client.ble_write:
+            id: x4_ble
+            service_uuid: ${x4_service}
+            characteristic_uuid: ${x4_write}
+            value: !lambda return {0x5a, 0x23, 0x02, 0x01, id(x4_unit)}; # active output volume
+        - delay: 200ms
+        - ble_client.ble_write:
+            id: x4_ble
+            service_uuid: ${x4_service}
+            characteristic_uuid: ${x4_write}
+            value: [0x5a, 0x23, 0x02, 0x01, 0x05] # mic volume
+        - delay: 200ms
+        - ble_client.ble_write:
+            id: x4_ble
+            service_uuid: ${x4_service}
+            characteristic_uuid: ${x4_write}
+            value: [0x5a, 0x24, 0x02, 0x01, 0x00] # playback mute
+        - delay: 200ms
+        - ble_client.ble_write:
+            id: x4_ble
+            service_uuid: ${x4_service}
+            characteristic_uuid: ${x4_write}
+            value: [0x5a, 0x24, 0x02, 0x01, 0x05] # mic mute
+
+globals:
+  # volume unit of the active output: 0x00 speakers, 0x01 headphones
+  - id: x4_unit
+    type: uint8_t
+    initial_value: "0"
+
+sensor:
+  # Receives every notify; reassembles 5a <cmd> <len> <payload> frames and
+  # publishes state to the entities below.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: x4_ble
+    id: x4_rx
+    internal: true
+    service_uuid: ${x4_service}
+    characteristic_uuid: ${x4_notify}
+    notify: true
+    update_interval: never
+    lambda: |-
+      static std::vector<uint8_t> buf;
+      buf.insert(buf.end(), x.begin(), x.end());
+      while (!buf.empty()) {
+        if (buf[0] != 0x5a) { buf.erase(buf.begin()); continue; }
+        if (buf.size() < 3 || buf.size() < 3u + buf[2]) break;
+        const uint8_t cmd = buf[1], len = buf[2];
+        const uint8_t *p = &buf[3];
+        if (cmd == 0x2c && len >= 2 && p[0] == 0x01) {
+          // output: 5a 2c 05 01 <01 spk / 04 hp> 00 00 00
+          id(x4_unit) = p[1] == 0x04 ? 1 : 0;
+          id(x4_headphones).publish_state(p[1] == 0x04);
+        } else if (cmd == 0x23 && len >= 3) {
+          // volume: 5a 23 <len> <unit> <int16 LE dB*256> ...
+          const float db = int16_t(p[1] | (p[2] << 8)) / 256.0f;
+          // % like PipeWire/PulseAudio (cubic): % = 100 * 10^(dB/60); -80 dB = off
+          const float pct = db <= -80 ? 0 : roundf(100 * powf(10, db / 60));
+          if (p[0] == id(x4_unit)) id(x4_volume).publish_state(std::string("${x4_volume_unit}") == "dB" ? db : pct);
+          else if (p[0] == 0x05) id(x4_mic_volume).publish_state(db);
+        } else if (cmd == 0x24 && len >= 2) {
+          // mute: 5a 24 02 <unit> <0/1>
+          if (p[0] == 0x00) id(x4_mute).publish_state(p[1]);
+          else if (p[0] == 0x05) id(x4_mic_mute).publish_state(p[1]);
+        }
+        buf.erase(buf.begin(), buf.begin() + 3 + len);
+      }
+      return buf.size();
+
+switch:
+  - platform: template
+    name: Headphones
+    id: x4_headphones
+    icon: mdi:headphones
+    restore_mode: DISABLED # default ALWAYS_OFF would fire turn_off_action at boot
+    turn_on_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x2c, 0x05, 0x00, 0x04, 0x00, 0x00, 0x00]
+    turn_off_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x2c, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00]
+
+  - platform: template
+    name: Mute
+    id: x4_mute
+    icon: mdi:volume-off
+    restore_mode: DISABLED
+    turn_on_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x03, 0x00, 0x00, 0x01]
+    turn_off_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x03, 0x00, 0x00, 0x00]
+
+  - platform: template
+    name: Mic Mute
+    id: x4_mic_mute
+    icon: mdi:microphone-off
+    restore_mode: DISABLED
+    # X4 sends no state push after a mic mute set -> query state afterwards
+    turn_on_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x03, 0x00, 0x05, 0x01]
+      - delay: 200ms
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x02, 0x01, 0x05]
+    turn_off_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x03, 0x00, 0x05, 0x00]
+      - delay: 200ms
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: [0x5a, 0x24, 0x02, 0x01, 0x05]
+
+number:
+  # Volume of the active output (speakers/headphones store separate levels).
+  # Unit per x4_volume_unit. % maps cubic like the desktop mixer:
+  # dB = 60 * log10(%/100), 0% = off. The X4 snaps to its own steps
+  # (46 levels + off); the pushed state shows the real value.
+  - platform: template
+    name: Volume
+    id: x4_volume
+    icon: mdi:volume-high
+    unit_of_measurement: ${x4_volume_unit}
+    min_value: "${ -80 if x4_volume_unit == 'dB' else 0 }"
+    max_value: "${ 0 if x4_volume_unit == 'dB' else 100 }"
+    step: "${ 0.1 if x4_volume_unit == 'dB' else 1 }"
+    mode: slider
+    set_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: !lambda |-
+            // X4 rounds up to its next level. Off needs <= -80.05 dB (exactly -80 rounds up to -55 dB).
+            float db;
+            if (std::string("${x4_volume_unit}") == "dB") db = x <= -80 ? -80.5f : x;
+            // aim 0.5% low so a set % reads back the same
+            else db = x <= 0 ? -80.5f : fmaxf(-80.5f, 60 * log10f((x - 0.5f) / 100));
+            const int16_t v = lroundf(db * 256);
+            return {0x5a, 0x23, 0x04, 0x00, id(x4_unit), uint8_t(v), uint8_t(v >> 8)};
+
+  - platform: template
+    name: Mic Volume
+    id: x4_mic_volume
+    icon: mdi:microphone
+    unit_of_measurement: dB
+    min_value: -96
+    max_value: 9
+    step: 1
+    mode: slider
+    set_action:
+      - ble_client.ble_write:
+          id: x4_ble
+          service_uuid: ${x4_service}
+          characteristic_uuid: ${x4_write}
+          value: !lambda |-
+            const int16_t v = lroundf(x * 256);
+            return {0x5a, 0x23, 0x04, 0x00, 0x05, uint8_t(v), uint8_t(v >> 8)};
