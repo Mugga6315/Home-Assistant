@@ -1,0 +1,293 @@
+# AIYIMA A80 amplifier control via the front-panel debug console (UART).
+#
+# The A80 LCD board (ArtInChip D121, Luban-Lite/RT-Thread) exposes a shell on
+# its 4-pad UART header (115200 8N1). State is read from RAM with `p`, control
+# fakes remote presses by writing the IR mailbox with `m` — the firmware handles
+# them like real remote presses, so display and saved settings stay in sync.
+# Details: wiki aiyima-a80-control.
+#
+# Wiring: amp "TX" pad -> ${a80_tx_pin}, amp "RX" pad -> ${a80_rx_pin}, GND.
+#
+# Usage (in the device yaml):
+#   packages:
+#     aiyima_a80: !include common/aiyima-a80.yaml
+
+substitutions:
+  a80_tx_pin: GPIO0 # ESP TX -> amp pad silk "TX"
+  a80_rx_pin: GPIO1 # ESP RX <- amp pad silk "RX"
+  a80_poll: 1s
+  a80_device_name: AIYIMA A80
+
+# All entities live on this sub-device, so they group as their own device in HA
+# and names like Volume/Mute don't clash with other packages on the same ESP.
+esphome:
+  devices:
+    - id: a80_device
+      name: ${a80_device_name}
+
+uart:
+  - id: a80_uart
+    tx_pin: ${a80_tx_pin}
+    rx_pin: ${a80_rx_pin}
+    baud_rate: 115200
+    rx_buffer_size: 1024
+
+globals:
+  # last read state, -1 = unknown
+  - id: a80_power
+    type: int
+    initial_value: "-1"
+  - id: a80_mute
+    type: int
+    initial_value: "-1"
+  - id: a80_input
+    type: int
+    initial_value: "-1"
+  - id: a80_vol
+    type: int
+    initial_value: "-1"
+  # volume target while ramping, -1 = idle
+  - id: a80_target
+    type: int
+    initial_value: "-1"
+
+script:
+  # Fake one remote press: NEC code 0xA0<cmd> into the IR mailbox, then set the "new" flag.
+  - id: a80_press
+    mode: queued
+    max_runs: 10
+    parameters:
+      cmd: int
+    then:
+      - lambda: |-
+          char buf[64];
+          snprintf(buf, sizeof(buf), "m 0x402d5118 0x0000a0%02x 4\r\nm 0x402d5114 1 1\r\n", cmd);
+          id(a80_uart).write_str(buf);
+
+  # Tone: write struct field (+13 bass / +14 treble), then call the firmware's
+  # own NJW1194 tone function (same one used at power-on). Saved at standby.
+  - id: a80_tone
+    mode: queued
+    max_runs: 4
+    parameters:
+      treble: bool
+      db: int
+    then:
+      - lambda: |-
+          char buf[64];
+          snprintf(buf, sizeof(buf), "m 0x402d3a%s %d 1\r\nf 0x%s %d\r\n",
+                   treble ? "de" : "dd", db & 0xff, treble ? "400267d8" : "400267a6", db);
+          id(a80_uart).write_str(buf);
+
+  # Style: write struct +10, then open + close the menu so the main screen
+  # is rebuilt with the new backdrop (menu shows briefly).
+  - id: a80_style_set
+    mode: restart
+    parameters:
+      style: int
+    then:
+      - lambda: |-
+          char buf[32];
+          snprintf(buf, sizeof(buf), "m 0x402d3ada %d 1\r\n", style);
+          id(a80_uart).write_str(buf);
+      - script.execute: { id: a80_press, cmd: 0xdb } # Menu/OK
+      - delay: 300ms
+      - script.execute: { id: a80_press, cmd: 0xeb } # Return
+
+interval:
+  # Poll app state struct (0x402D3AD0). Paused while ramping volume.
+  - interval: ${a80_poll}
+    then:
+      - lambda: |-
+          if (id(a80_target) < 0) id(a80_uart).write_str("p 0x402d3ad0 32 1\r\n");
+
+  # Volume ramp: one Vol+/- press per tick (~1 s for 25 steps).
+  - interval: 40ms
+    then:
+      - lambda: |-
+          if (id(a80_target) < 0 || id(a80_vol) < 0) return;
+          if (id(a80_vol) == id(a80_target)) { id(a80_target) = -1; return; }
+          const bool up = id(a80_vol) < id(a80_target);
+          id(a80_press)->execute(up ? 0xa8 : 0xfa);
+          id(a80_vol) += up ? 1 : -1;
+
+  # Read console lines; parse the two `p` dump lines.
+  # 402d3ad0: +8 power, +10 style, +11 input, +12 volume, +13 bass, +14 treble, +15 mute
+  # 402d3ae0: +16 brightness
+  - interval: 10ms
+    then:
+      - lambda: |-
+          static std::string line;
+          uint8_t c;
+          while (id(a80_uart).available() && id(a80_uart).read_byte(&c)) {
+            if (c != '\n') {
+              if (c != '\r' && line.size() < 160) line += (char) c;
+              continue;
+            }
+            size_t pos;
+            uint8_t b[16];
+            bool ok = false;
+            for (const char *tag : {"402d3ad0: ", "402d3ae0: "}) {
+              if ((pos = line.find(tag)) == std::string::npos) continue;
+              const char *p = line.c_str() + pos + 10;
+              int n = 0;
+              for (char *end; n < 16; n++, p = end) {
+                b[n] = strtoul(p, &end, 16);
+                if (end == p) break;
+              }
+              ok = n == 16;
+              break;
+            }
+            // Publish only on change (switches already skip unchanged values internally).
+            auto num = [](number::Number *n, float v) {
+              if (!n->has_state() || n->state != v) n->publish_state(v);
+            };
+            auto sel = [](select::Select *s, size_t i) {
+              auto cur = s->active_index();
+              if (!cur.has_value() || *cur != i) s->publish_state(i);
+            };
+            if (ok && pos != std::string::npos && line.compare(pos, 8, "402d3ad0") == 0) {
+              id(a80_power) = b[8];
+              id(a80_input) = b[11];
+              id(a80_mute) = b[15];
+              id(a80_power_sw).publish_state(b[8]);
+              id(a80_mute_sw).publish_state(b[15]);
+              if (b[11] < 6) sel(id(a80_input_sel), b[11]);
+              if (id(a80_target) < 0) {
+                id(a80_vol) = b[12];
+                num(id(a80_volume), b[12]);
+              }
+              num(id(a80_bass), (int8_t) b[13]);
+              num(id(a80_treble), (int8_t) b[14]);
+              if (b[10] < 3) sel(id(a80_style), b[10]);
+            } else if (ok) {
+              auto *s = id(a80_brightness);
+              if (!s->has_state() || s->state != b[0]) s->publish_state(b[0]);
+            }
+            line.clear();
+          }
+
+switch:
+  # ON/OFF and Mute are remote toggles -> only press when state differs.
+  - platform: template
+    name: Power
+    device_id: a80_device
+    id: a80_power_sw
+    icon: mdi:power
+    restore_mode: DISABLED
+    turn_on_action:
+      - if:
+          condition:
+            lambda: return id(a80_power) == 0;
+          then:
+            - script.execute: { id: a80_press, cmd: 0xe9 }
+    turn_off_action:
+      - if:
+          condition:
+            lambda: return id(a80_power) == 1;
+          then:
+            - script.execute: { id: a80_press, cmd: 0xe9 }
+
+  - platform: template
+    name: Mute
+    device_id: a80_device
+    id: a80_mute_sw
+    icon: mdi:volume-off
+    restore_mode: DISABLED
+    turn_on_action:
+      - if:
+          condition:
+            lambda: return id(a80_mute) == 0;
+          then:
+            - script.execute: { id: a80_press, cmd: 0xf5 }
+    turn_off_action:
+      - if:
+          condition:
+            lambda: return id(a80_mute) == 1;
+          then:
+            - script.execute: { id: a80_press, cmd: 0xf5 }
+
+number:
+  # A80 volume scale 0-99 (display bar). Set ramps via Vol+/- presses.
+  - platform: template
+    name: Volume
+    device_id: a80_device
+    id: a80_volume
+    icon: mdi:volume-high
+    min_value: 0
+    max_value: 99
+    step: 1
+    mode: slider
+    set_action:
+      - lambda: id(a80_target) = (int) x;
+
+  - platform: template
+    name: Bass
+    device_id: a80_device
+    id: a80_bass
+    icon: mdi:equalizer
+    unit_of_measurement: dB
+    min_value: -10
+    max_value: 10
+    step: 1
+    set_action:
+      - script.execute: { id: a80_tone, treble: false, db: !lambda return (int) x; }
+
+  - platform: template
+    name: Treble
+    device_id: a80_device
+    id: a80_treble
+    icon: mdi:equalizer
+    unit_of_measurement: dB
+    min_value: -10
+    max_value: 10
+    step: 1
+    set_action:
+      - script.execute: { id: a80_tone, treble: true, db: !lambda return (int) x; }
+
+select:
+  # Input order = firmware index. Set: write index-1, then one Input press
+  # (the firmware advances by one and does the full switch).
+  - platform: template
+    name: Input
+    device_id: a80_device
+    id: a80_input_sel
+    icon: mdi:import
+    options: [RCA, TRS, COAX, OPT, USB, BT]
+    set_action:
+      - lambda: |-
+          auto i = id(a80_input_sel).index_of(x.c_str(), x.size());
+          if (!i.has_value() || (int) *i == id(a80_input)) return;
+          char buf[32];
+          snprintf(buf, sizeof(buf), "m 0x402d3adb %d 1\r\n", (int) ((*i + 5) % 6));
+          id(a80_uart).write_str(buf);
+          id(a80_press)->execute(0xac);
+
+  - platform: template
+    name: Style
+    device_id: a80_device
+    id: a80_style
+    icon: mdi:palette
+    options: ["1", "2", "3"]
+    set_action:
+      - script.execute:
+          id: a80_style_set
+          style: !lambda return x.c_str()[0] - '1';
+
+button:
+  # Light: steps display brightness like the remote button.
+  - platform: template
+    name: Light
+    device_id: a80_device
+    icon: mdi:brightness-6
+    on_press:
+      - script.execute: { id: a80_press, cmd: 0xef }
+
+sensor:
+  - platform: template
+    name: Brightness
+    device_id: a80_device
+    id: a80_brightness
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    accuracy_decimals: 0

@@ -12,6 +12,14 @@ substitutions:
   x4_service: "B7860001-11B8-B681-6343-5A6C2286633F"
   x4_write: "B7860002-11B8-B681-6343-5A6C2286633F"
   x4_notify: "B7860003-11B8-B681-6343-5A6C2286633F"
+  x4_device_name: Sound Blaster X4
+
+# All entities live on this sub-device, so they group as their own device in HA
+# and names like Volume/Mute don't clash with other packages on the same ESP.
+esphome:
+  devices:
+    - id: x4_device
+      name: ${x4_device_name}
 
 esp32_ble_tracker:
 
@@ -101,6 +109,7 @@ sensor:
 switch:
   - platform: template
     name: Headphones
+    device_id: x4_device
     id: x4_headphones
     icon: mdi:headphones
     restore_mode: DISABLED # default ALWAYS_OFF would fire turn_off_action at boot
@@ -119,6 +128,7 @@ switch:
 
   - platform: template
     name: Mute
+    device_id: x4_device
     id: x4_mute
     icon: mdi:volume-off
     restore_mode: DISABLED
@@ -137,6 +147,7 @@ switch:
 
   - platform: template
     name: Mic Mute
+    device_id: x4_device
     id: x4_mic_mute
     icon: mdi:microphone-off
     restore_mode: DISABLED
@@ -173,6 +184,7 @@ number:
   # (46 levels + off); the pushed state shows the real value.
   - platform: template
     name: Volume
+    device_id: x4_device
     id: x4_volume
     icon: mdi:volume-high
     unit_of_measurement: ${x4_volume_unit}
@@ -196,6 +208,7 @@ number:
 
   - platform: template
     name: Mic Volume
+    device_id: x4_device
     id: x4_mic_volume
     icon: mdi:microphone
     unit_of_measurement: dB
